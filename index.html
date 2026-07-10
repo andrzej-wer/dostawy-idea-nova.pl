@@ -64,8 +64,8 @@ nav{background:var(--nav-bg);padding:0 1rem;display:flex;align-items:center;gap:
 .cal-cell.other-month{opacity:.25}
 .cal-dot-row{display:flex;gap:2px;justify-content:center;flex-wrap:wrap}
 .cal-dot{width:5px;height:5px;border-radius:50%;background:var(--accent)}
-.cal-dot.cash{background:var(--gold)}
-.cal-dot.hi{background:var(--red)}
+.cal-dot.done{background:var(--green)}
+.cal-dot.pend{background:var(--red)}
 .cal-count{font-family:var(--mono);font-size:9px;background:var(--accent);color:#fff;border-radius:6px;padding:0 5px;font-weight:700;line-height:1.6}
 .cal-cell.selected .cal-count{background:rgba(255,255,255,.3)}
 
@@ -373,6 +373,12 @@ nav{background:var(--nav-bg);padding:0 1rem;display:flex;align-items:center;gap:
     <p id="driver-subtitle"></p>
   </div>
   <div style="max-width:600px;margin:0 auto">
+    <div style="padding:1rem 1.25rem;background:var(--card);border-bottom:1px solid var(--border)">
+      <label style="display:block;font-family:var(--mono);font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px">📝 Notatki kierowcy</label>
+      <textarea id="driver-notes" placeholder="Zapiski na dziś — np. sprawy do załatwienia, odbiory…"
+        style="width:100%;font-family:var(--sans);font-size:16px;border:1px solid var(--border);border-radius:var(--r-sm);padding:12px;background:#fffbeb;color:var(--text);outline:none;min-height:64px;resize:vertical"
+        onchange="saveDriverNotes(this.value)"></textarea>
+    </div>
     <div class="driver-stops" id="driver-stops"></div>
     <div class="empty" id="driver-empty" style="margin:1.5rem;border-radius:var(--r);display:none">
       <div class="empty-icon">✅</div>Brak dostaw.
@@ -802,6 +808,7 @@ function updateStatsRoute(){
 /* ═══════════════ RENDER — DRIVER ═══════════════ */
 function openDriverView(){renderDriver();switchView('driver');}
 function renderDriver(){
+  loadDriverNotes();
   var date=document.getElementById('delivery-date').value;
   var dtf=date?new Date(date+'T12:00:00').toLocaleDateString('pl-PL',{weekday:'long',day:'numeric',month:'long'}):'';
   var valid=order.filter(function(i){return stops[i]&&stops[i].addr.trim();});
@@ -902,13 +909,15 @@ function renderCalendar(){
       var n=st.length;
       if(n>0){
         cnt='<div class="cal-count">'+n+'</div>';
-        var hiN=st.filter(function(s){return s.priority==='high';}).length;
-        var cashN=st.filter(function(s){return s.cash;}).length;
-        var normN=n-hiN-cashN;
+        /* kropki: zielone = wykonane, czerwone = niewykonane */
+        var doneN=0;
+        st.forEach(function(s,si){
+          if(sv.checked&&sv.checked[si]) doneN++;
+        });
+        var pendN=n-doneN;
         dots='<div class="cal-dot-row">'
-          +new Array(Math.min(hiN,3)).fill('<div class="cal-dot hi"></div>').join('')
-          +new Array(Math.min(Math.max(normN,0),3)).fill('<div class="cal-dot"></div>').join('')
-          +new Array(Math.min(cashN,2)).fill('<div class="cal-dot cash"></div>').join('')
+          +new Array(Math.min(doneN,4)).fill('<div class="cal-dot done"></div>').join('')
+          +new Array(Math.min(pendN,4)).fill('<div class="cal-dot pend"></div>').join('')
           +'</div>';
       }
     }catch(e){}}
@@ -1380,10 +1389,14 @@ function renderStats() {
   var totalDays = data.length;
   /* Licz tylko wykonane (odkliknięte) */
   var totalStops = 0, highPrio = 0;
-  var completedStops = []; /* {stop, date} dla dalszych analiz */
+  var completedStops = [];
+  var todayS = todayStr();
   data.forEach(function(d){
+    var anyChk = d.checked && Object.keys(d.checked).some(function(k){ return k!=='_notes' && d.checked[k]; });
+    var past = d.date < todayS;
     d.stops.forEach(function(s, si){
-      if (!d.checked[si]) return;
+      var done = (d.checked && d.checked[si]) || (past && !anyChk);
+      if (!done) return;
       totalStops++;
       if (s.priority==='high') highPrio++;
       completedStops.push({stop:s, date:d.date, lat:s.lat, lng:s.lng});
@@ -1408,8 +1421,10 @@ function renderStats() {
   /* ── WYKRES DZIENNY ── */
   var last = data.slice(-28);
   var countDone = function(d){
+    var anyC = d.checked && Object.keys(d.checked).some(function(k){ return k!=='_notes' && d.checked[k]; });
+    var pastD = d.date < todayS;
     var n=0; d.stops.forEach(function(s,si){
-      if(d.checked[si]) n++;
+      if((d.checked&&d.checked[si])||(pastD&&!anyC)) n++;
     }); return n;
   };
   var maxStops = Math.max.apply(null, last.map(function(d){return countDone(d);}).concat([1]));
@@ -1427,14 +1442,18 @@ function renderStats() {
 
   /* ── TOP KLIENCI ── */
   var clientCount = {};
-  data.forEach(function(d){ d.stops.forEach(function(s, si){
-    /* Tylko wykonane dostawy (odkliknięte przez kierowcę) */
-    if (!d.checked[si]) return;
-    var name = s.clientName || s.addr;
-    if (!name) return;
-    if (!clientCount[name]) clientCount[name] = {count:0, addr:s.addr};
-    clientCount[name].count++;
-  }); });
+  data.forEach(function(d){
+    var anyChk2 = d.checked && Object.keys(d.checked).some(function(k){ return k!=='_notes' && d.checked[k]; });
+    var past2 = d.date < todayS;
+    d.stops.forEach(function(s, si){
+      var done = (d.checked && d.checked[si]) || (past2 && !anyChk2);
+      if (!done) return;
+      var name = s.clientName || s.addr;
+      if (!name) return;
+      if (!clientCount[name]) clientCount[name] = {count:0, addr:s.addr};
+      clientCount[name].count++;
+    });
+  });
   /* Oblicz zakres miesięcy */
   var firstDate = data.length ? data[0].date : todayStr();
   var lastDate = data.length ? data[data.length-1].date : todayStr();
@@ -1642,6 +1661,30 @@ async function driverMoveStop(idx, dir) {
   order = displayOrder;
   await saveDay();
   renderDriver();
+}
+
+
+/* ═══════════════ NOTATKI KIEROWCY ═══════════════ */
+var driverNotes = '';
+
+async function saveDriverNotes(val) {
+  driverNotes = val;
+  var date = document.getElementById('delivery-date').value;
+  localStorage.setItem('notes_' + date, val);
+  /* Zapisz w Supabase razem z planem — dodatkowe pole w checked jako '_notes' */
+  try {
+    checked['_notes'] = val;
+    await saveDay();
+  } catch(e) { console.warn('notes save:', e); }
+}
+
+function loadDriverNotes() {
+  var date = document.getElementById('delivery-date').value;
+  /* Priorytet: checked['_notes'] z chmury, fallback localStorage */
+  var notes = (checked && checked['_notes']) || localStorage.getItem('notes_' + date) || '';
+  driverNotes = notes;
+  var el = document.getElementById('driver-notes');
+  if (el) el.value = notes;
 }
 
 </script>
