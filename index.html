@@ -396,13 +396,21 @@ nav{background:var(--nav-bg);padding:0 1rem;display:flex;align-items:center;gap:
 var SUPA_URL = 'https://yzuetqrilbpvikfveobd.supabase.co';
 var SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inl6dWV0cXJpbGJwdmlrZnZlb2JkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODMxODgyMDEsImV4cCI6MjA5ODc2NDIwMX0.nZi6VtlyPggSG-omkuyVP_wQaBP2eSDti7ubAJnVGFM';
 
-async function supaFetch(path, method, body) {
-  var opts = {method:method||'GET', headers:{'apikey':SUPA_KEY,'Authorization':'Bearer '+SUPA_KEY,'Content-Type':'application/json','Prefer':method==='POST'?'return=representation':''} };
+async function supaFetch(path, method, body, timeoutMs) {
+  var opts = {method:method||'GET', headers:{'apikey':SUPA_KEY,'Authorization':'Bearer '+SUPA_KEY,'Content-Type':'application/json','Prefer':method==='POST'||method==='PATCH'?'return=representation':''} };
   if (body) opts.body = JSON.stringify(body);
-  var r = await fetch(SUPA_URL+'/rest/v1/'+path, opts);
-  if (!r.ok) throw new Error(await r.text());
-  var ct = r.headers.get('content-type')||'';
-  return ct.includes('json') ? r.json() : null;
+  var timer;
+  if (timeoutMs) {
+    var controller = new AbortController();
+    opts.signal = controller.signal;
+    timer = setTimeout(function() { controller.abort(); }, timeoutMs);
+  }
+  try {
+    var r = await fetch(SUPA_URL+'/rest/v1/'+path, opts);
+    if (!r.ok) throw new Error(await r.text());
+    var ct = r.headers.get('content-type')||'';
+    return ct.includes('json') ? await r.json() : null;
+  } finally { clearTimeout(timer); }
 }
 
 async function loadAllDatesFromCloud() {
@@ -414,10 +422,44 @@ async function loadAllDatesFromCloud() {
 }
 
 async function syncClientsFromCloud() {
-  var rows = await supaFetch('clients_db?select=data&limit=1', 'GET', null);
-  if (rows && rows.length && rows[0].data && rows[0].data.length > 0) {
-    localStorage.setItem('clientsDB', JSON.stringify(rows[0].data));
+  var before = localStorage.getItem('clientsDB');
+  var row = await readClientsFromCloud();
+  if (row && !clientSaveInProgress && clientEditSnapshot === null && localStorage.getItem('clientsDB') === before) {
+    var next = JSON.stringify(row.data);
+    if (before && before !== next && localStorage.getItem('clientsDBBackupBeforeSync') === null) {
+      localStorage.setItem('clientsDBBackupBeforeSync', before);
+    }
+    localStorage.setItem('clientsDB', next);
+    if (document.getElementById('client-search')) showClientList();
   }
+}
+
+function clientDataError(message) {
+  var error = new Error(message);
+  error.clientMessage = message;
+  return error;
+}
+
+function clientsSignature(value) {
+  if (Array.isArray(value)) return '[' + value.map(clientsSignature).join(',') + ']';
+  if (value && typeof value === 'object') {
+    return '{' + Object.keys(value).sort().map(function(key) {
+      return JSON.stringify(key) + ':' + clientsSignature(value[key]);
+    }).join(',') + '}';
+  }
+  return JSON.stringify(value);
+}
+
+async function readClientsFromCloud() {
+  var rows = await supaFetch('clients_db?select=id,data,updated_at&order=id.asc&limit=2', 'GET', null, 15000);
+  if (!Array.isArray(rows) || rows.length > 1) {
+    throw clientDataError('Nie można jednoznacznie odczytać bazy klientów. Skontaktuj się z administratorem.');
+  }
+  if (!rows.length) return null;
+  if (rows[0].id == null || !Array.isArray(rows[0].data)) {
+    throw clientDataError('Baza klientów ma nieprawidłowy format. Zapis został wstrzymany.');
+  }
+  return rows[0];
 }
 
 function updateSyncStatus(ok) {
@@ -480,14 +522,29 @@ async function saveDay() {
 /* ═══════════════ CLIENTS DB ═══════════════ */
 function getClientsDB() {
   var raw = localStorage.getItem('clientsDB');
-  return raw ? JSON.parse(raw) : CLIENTS;
+  return JSON.parse(raw || JSON.stringify(CLIENTS));
 }
-async function saveClientsDB(arr) {
-  localStorage.setItem('clientsDB', JSON.stringify(arr));
-  try {
-    await supaFetch('clients_db?id=eq.1', 'DELETE', null);
-    await supaFetch('clients_db', 'POST', {id:1, data:arr});
-  } catch(e) { console.warn('clients save failed:',e); }
+async function saveClientsDB(arr, base) {
+  var row = await readClientsFromCloud();
+  var saved;
+  if (row && clientsSignature(row.data) === clientsSignature(arr)) {
+    // A previous response may have been lost after the server accepted the save.
+    saved = [row];
+  } else if (row) {
+    if (clientsSignature(row.data) !== clientsSignature(base)) {
+      throw clientDataError('Baza klientów została zmieniona na innym urządzeniu. Zamknij formularz, odśwież stronę i ponów zmianę.');
+    }
+    var version = row.updated_at == null ? 'is.null' : 'eq.' + encodeURIComponent(row.updated_at);
+    var updatedAt = new Date(Math.max(Date.now(), (Date.parse(row.updated_at) || 0) + 1)).toISOString();
+    saved = await supaFetch('clients_db?id=eq.' + encodeURIComponent(row.id) + '&updated_at=' + version, 'PATCH', {data:arr, updated_at:updatedAt}, 15000);
+  } else {
+    // id is GENERATED ALWAYS AS IDENTITY: the database assigns it on insert.
+    saved = await supaFetch('clients_db', 'POST', {data:arr}, 15000);
+  }
+  if (!Array.isArray(saved) || saved.length !== 1 || saved[0].id == null || clientsSignature(saved[0].data) !== clientsSignature(arr)) {
+    throw clientDataError('Nie potwierdzono zapisu. Baza mogła zmienić się na innym urządzeniu. Odśwież stronę i spróbuj ponownie.');
+  }
+  localStorage.setItem('clientsDB', JSON.stringify(saved[0].data));
 }
 
 /* ═══════════════ STOPS ═══════════════ */
@@ -978,53 +1035,76 @@ function renderHistory(){
 
 /* ═══════════════ CLIENT MANAGER ═══════════════ */
 var clientEditIdx = null; // null=nowy, number=edit
+var clientEditSnapshot = null;
+var clientListSnapshot = [];
+var clientSaveInProgress = false;
 
 function openClientManager() {
-  clientEditIdx = null;
+  if (clientSaveInProgress) return;
   showClientList();
   document.getElementById('client-modal').classList.add('open');
 }
-function closeClientModal() { document.getElementById('client-modal').classList.remove('open'); }
+function closeClientModal() {
+  if (clientSaveInProgress) return;
+  clientEditIdx = null;
+  clientEditSnapshot = null;
+  document.getElementById('client-modal').classList.remove('open');
+}
 document.getElementById('client-modal').addEventListener('click', function(e){ if(e.target===this) closeClientModal(); });
 
 function showClientList() {
+  if (clientSaveInProgress) return;
+  clientEditIdx = null;
+  clientEditSnapshot = null;
   document.getElementById('client-modal-title').textContent = 'Baza klientów';
   var db = getClientsDB();
+  clientListSnapshot = db;
   var body = '<input class="client-search" id="client-search" placeholder="Szukaj…" oninput="filterClientList(this.value)">'
     + '<div class="client-list" id="client-list-inner">'
     + renderClientRows(db)
     + '</div>'
     + '<button class="btn btn-primary btn-sm" onclick="openNewClient()">＋ Dodaj nowego klienta</button>';
   document.getElementById('client-modal-body').innerHTML = body;
+  document.querySelector('#client-modal .modal-actions').innerHTML =
+    '<button class="btn btn-outline btn-sm" onclick="closeClientModal()">Zamknij</button>';
 }
 
-function renderClientRows(db) {
-  if (!db.length) return '<div style="padding:1rem;color:var(--muted);font-size:13px">Brak klientów.</div>';
-  return db.map(function(c, i) {
+function renderClientRows(db, query) {
+  var q = (query || '').trim().toLowerCase();
+  var rows = db.map(function(c, i) {
+    if (q && ![c.name, c.addr, c.city, c.phone].join(' ').toLowerCase().includes(q)) return '';
     return '<div class="client-row">'
       + '<span class="client-row-name">' + esc(c.name) + '</span>'
       + '<span class="client-row-addr">' + esc(c.addr) + '</span>'
       + '<button class="btn btn-outline btn-xs" onclick="openEditClient(' + i + ')">Edytuj</button>'
       + '</div>';
   }).join('');
+  return rows || '<div style="padding:1rem;color:var(--muted);font-size:13px">Brak klientów.</div>';
 }
 
 function filterClientList(q) {
-  var db = getClientsDB();
-  var filtered = q.trim() ? db.filter(function(c){ return (c.name+c.addr+c.city).toLowerCase().includes(q.toLowerCase()); }) : db;
-  document.getElementById('client-list-inner').innerHTML = renderClientRows(filtered);
+  document.getElementById('client-list-inner').innerHTML = renderClientRows(clientListSnapshot, q);
 }
 
 function openNewClient() {
+  if (clientSaveInProgress) return;
   clientEditIdx = null;
+  clientEditSnapshot = clientsSignature(getClientsDB());
   showClientForm({name:'', addr:'', city:'', phone:''});
 }
 function openEditClient(i) {
+  if (clientSaveInProgress) return;
+  if (!clientListSnapshot[i] || clientsSignature(getClientsDB()) !== clientsSignature(clientListSnapshot)) {
+    showClientList();
+    toast('Lista klientów została odświeżona. Wybierz klienta ponownie.');
+    return;
+  }
   clientEditIdx = i;
-  var db = getClientsDB();
-  showClientForm(db[i]);
+  clientEditSnapshot = clientsSignature(clientListSnapshot);
+  showClientForm(clientListSnapshot[i]);
 }
 function showClientForm(c) {
+  c = Object.assign({}, c);
   /* Rozparsuj stary addr na pola jeśli brak street */
   if (!c.street && c.addr) {
     var parts = c.addr.match(/^(.+?),\s*(\d{2}-\d{3})\s+(.+)$/);
@@ -1049,33 +1129,72 @@ function showClientForm(c) {
     +'</div>'
     + '<div class="field"><label>Telefon</label>'
     + '<input type="text" id="cf-phone" value="' + esc(c.phone||'') + '" placeholder="600 000 000"></div>'
+    + '<div id="client-save-error" role="alert" style="display:none;margin-top:.75rem;color:var(--red);font-size:13px"></div>'
     + (clientEditIdx !== null ? '<div style="margin-top:.875rem"><button class="btn btn-danger btn-xs" onclick="deleteClient()">Usuń tego klienta</button></div>' : '');
   document.querySelector('#client-modal .modal-actions').innerHTML =
     '<button class="btn btn-outline btn-sm" onclick="showClientList()">← Powrót</button>'
-    + '<button class="btn btn-primary btn-sm" onclick="saveClient()">Zapisz</button>';
+    + '<button class="btn btn-primary btn-sm" id="client-save-btn" onclick="saveClient()">Zapisz</button>';
 }
+
+function setClientSaving(saving) {
+  clientSaveInProgress = saving;
+  document.querySelectorAll('#client-modal input, #client-modal button').forEach(function(el) { el.disabled = saving; });
+  var button = document.getElementById('client-save-btn');
+  if (button) button.textContent = saving ? 'Zapisywanie…' : 'Zapisz';
+}
+
+function showClientSaveError(error) {
+  var el = document.getElementById('client-save-error');
+  if (el) {
+    el.textContent = error.clientMessage || 'Nie udało się zapisać zmiany w bazie. Sprawdź połączenie i spróbuj ponownie. Dane pozostają w formularzu.';
+    el.style.display = 'block';
+  }
+  console.warn('clients save failed:', error);
+}
+
 async function saveClient() {
+  if (clientSaveInProgress || !document.getElementById('cf-name')) return;
   var name = document.getElementById('cf-name').value.trim();
   if (!name) { alert('Podaj nazwę klienta.'); return; }
   var street = document.getElementById('cf-street').value.trim();
   var zip    = document.getElementById('cf-zip').value.trim();
   var city   = document.getElementById('cf-city').value.trim();
-  var addr   = street + (zip ? ', '+zip : '') + (city ? ' '+city : '');
-  var c = { name:name, addr:addr, street:street, zip:zip, city:city, phone:document.getElementById('cf-phone').value.trim() };
-  var db = getClientsDB();
-  if (clientEditIdx === null) db.unshift(c); else db[clientEditIdx] = c;
-  await saveClientsDB(db);
-  toast('Klient zapisany ✓');
-  showClientList();
-  document.querySelector('#client-modal .modal-actions').innerHTML =
-    '<button class="btn btn-outline btn-sm" onclick="closeClientModal()">Zamknij</button>';
+  var addr   = street + (street && (zip || city) ? ', ' : '') + [zip, city].filter(Boolean).join(' ');
+  setClientSaving(true);
+  document.getElementById('client-save-error').style.display = 'none';
+  try {
+    var base = getClientsDB();
+    if (clientsSignature(base) !== clientEditSnapshot) {
+      throw clientDataError('Lista klientów zmieniła się podczas edycji. Wróć do listy i ponownie otwórz formularz.');
+    }
+    var db = base.slice();
+    var c = Object.assign({}, clientEditIdx === null ? {} : base[clientEditIdx], {name:name, addr:addr, street:street, zip:zip, city:city, phone:document.getElementById('cf-phone').value.trim()});
+    if (clientEditIdx === null) db.unshift(c); else db[clientEditIdx] = c;
+    await saveClientsDB(db, base);
+    setClientSaving(false);
+    toast('Klient zapisany ✓');
+    showClientList();
+  } catch(e) { showClientSaveError(e); }
+  finally { setClientSaving(false); }
 }
 async function deleteClient() {
+  if (clientSaveInProgress || clientEditIdx === null) return;
   if (!confirm('Usunąć tego klienta z bazy?')) return;
-  var db = getClientsDB(); db.splice(clientEditIdx, 1); await saveClientsDB(db);
-  toast('Klient usunięty'); showClientList();
-  document.querySelector('#client-modal .modal-actions').innerHTML =
-    '<button class="btn btn-outline btn-sm" onclick="closeClientModal()">Zamknij</button>';
+  setClientSaving(true);
+  document.getElementById('client-save-error').style.display = 'none';
+  try {
+    var base = getClientsDB();
+    if (clientsSignature(base) !== clientEditSnapshot) {
+      throw clientDataError('Lista klientów zmieniła się podczas edycji. Wróć do listy i ponownie otwórz formularz.');
+    }
+    var db = base.slice();
+    db.splice(clientEditIdx, 1);
+    await saveClientsDB(db, base);
+    setClientSaving(false);
+    toast('Klient usunięty');
+    showClientList();
+  } catch(e) { showClientSaveError(e); }
+  finally { setClientSaving(false); }
 }
 
 /* ═══════════════ MISC ═══════════════ */
@@ -1735,3 +1854,4 @@ function loadDriverNotes() {
 
 </body>
 </html>
+
