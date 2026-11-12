@@ -125,6 +125,10 @@ nav{background:var(--nav-bg);padding:0 1rem;display:flex;align-items:center;gap:
 .btn-remove-card:hover,.btn-remove-card:active{background:rgba(255,255,255,.12);color:rgba(255,255,255,.7)}
 .card-body{padding:.875rem;display:grid;grid-template-columns:1fr;gap:.75rem}
 .field label{display:block;font-family:var(--mono);font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px}
+.client-field-heading{display:flex;align-items:center;justify-content:space-between;gap:.5rem;flex-wrap:wrap;margin-bottom:5px}
+.client-field-heading label{margin-bottom:0}
+.client-form-context{font-size:13px;line-height:1.5;color:var(--text2);background:var(--accent-soft);padding:.75rem;border-radius:var(--r-sm);margin-bottom:1rem}
+.client-match-choice{width:100%;flex-direction:column;align-items:flex-start;white-space:normal;text-align:left;margin-bottom:.5rem}
 .field input,.field textarea,.field select{width:100%;font-family:var(--sans);font-size:16px;border:1px solid var(--border);border-radius:var(--r-sm);padding:12px;background:var(--card);color:var(--text);outline:none;transition:border-color .12s,box-shadow .12s;min-height:48px}
 .field input:focus,.field textarea:focus,.field select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(37,99,235,.12)}
 .field textarea{resize:vertical;min-height:64px}
@@ -396,8 +400,8 @@ nav{background:var(--nav-bg);padding:0 1rem;display:flex;align-items:center;gap:
 var SUPA_URL = 'https://yzuetqrilbpvikfveobd.supabase.co';
 var SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inl6dWV0cXJpbGJwdmlrZnZlb2JkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODMxODgyMDEsImV4cCI6MjA5ODc2NDIwMX0.nZi6VtlyPggSG-omkuyVP_wQaBP2eSDti7ubAJnVGFM';
 
-async function supaFetch(path, method, body, timeoutMs) {
-  var opts = {method:method||'GET', headers:{'apikey':SUPA_KEY,'Authorization':'Bearer '+SUPA_KEY,'Content-Type':'application/json','Prefer':method==='POST'||method==='PATCH'?'return=representation':''} };
+async function supaFetch(path, method, body, timeoutMs, preference) {
+  var opts = {method:method||'GET', headers:{'apikey':SUPA_KEY,'Authorization':'Bearer '+SUPA_KEY,'Content-Type':'application/json','Prefer':preference || (method==='POST'||method==='PATCH'?'return=representation':'')} };
   if (body) opts.body = JSON.stringify(body);
   var timer;
   if (timeoutMs) {
@@ -424,7 +428,7 @@ async function loadAllDatesFromCloud() {
 async function syncClientsFromCloud() {
   var before = localStorage.getItem('clientsDB');
   var row = await readClientsFromCloud();
-  if (row && !clientSaveInProgress && clientEditSnapshot === null && localStorage.getItem('clientsDB') === before) {
+  if (row && !clientSaveInProgress && !clientStopContext && clientEditSnapshot === null && localStorage.getItem('clientsDB') === before) {
     var next = JSON.stringify(row.data);
     if (before && before !== next && localStorage.getItem('clientsDBBackupBeforeSync') === null) {
       localStorage.setItem('clientsDBBackupBeforeSync', before);
@@ -507,16 +511,25 @@ async function loadDay(date) {
     }
   } catch(e) { updateSyncStatus(false); console.warn('load failed:',e); }
 }
+var daySaveQueue = Promise.resolve();
 async function saveDay() {
   var date = document.getElementById('delivery-date').value;
-  var payload = {stops:stops, order:order, checked:checked};
+  var payload = JSON.parse(JSON.stringify({stops:stops, order:order, checked:checked}));
   localStorage.setItem(storageKey(date), JSON.stringify(payload));
-  try {
-    await supaFetch('delivery_plans?date=eq.'+date, 'DELETE', null);
-    await supaFetch('delivery_plans', 'POST', {date:date, stops:stops, order:order, checked:checked});
-    updateSyncStatus(true);
-  } catch(e) { updateSyncStatus(false); console.warn('save failed:',e); }
-  renderCalendar();
+  var save = daySaveQueue.then(async function() {
+    try {
+      var saved = await supaFetch('delivery_plans?on_conflict=date', 'POST', {date:date, stops:payload.stops, order:payload.order, checked:payload.checked, updated_at:new Date().toISOString()}, 15000, 'resolution=merge-duplicates,return=representation');
+      if (!Array.isArray(saved) || saved.length !== 1 || saved[0].date !== date) throw new Error('Nie potwierdzono zapisu planu dostaw.');
+      updateSyncStatus(true);
+      return true;
+    } catch(e) {
+      updateSyncStatus(false);
+      console.warn('save failed:',e);
+      return false;
+    } finally { renderCalendar(); }
+  });
+  daySaveQueue = save.catch(function() {});
+  return save;
 }
 
 /* ═══════════════ CLIENTS DB ═══════════════ */
@@ -560,7 +573,7 @@ async function removeStop(idx) {
 }
 async function updateStop(idx, field, val) {
   stops[idx][field]=val;
-  if(field==='addr'){stops[idx].lat=null;stops[idx].lng=null;stops[idx].clientName='';stops[idx].phone='';}
+  if(field==='addr'){stops[idx].lat=null;stops[idx].lng=null;stops[idx].clientName='';stops[idx].phone='';delete stops[idx].clientId;}
   await saveDay(); updateStatsRoute();
 }
 async function updatePrio(idx, val) { stops[idx].priority = val; await saveDay(); renderDispatcher(); }
@@ -590,6 +603,9 @@ async function pickClient(idx,matchIdx){
   var c = box && box._matches ? box._matches[matchIdx] : null;
   if(!c) return;
   stops[idx].clientName=c.name; stops[idx].addr=c.addr; stops[idx].phone=c.phone||''; stops[idx].lat=null; stops[idx].lng=null;
+  if(c.clientId) stops[idx].clientId=c.clientId; else delete stops[idx].clientId;
+  var input=document.getElementById('addr-inp-'+idx);
+  if(input) input.value=c.name||c.addr||'';
   await saveDay(); renderDispatcher();
   if(box) box.classList.remove('open');
 }
@@ -771,7 +787,7 @@ function renderDispatcher(){
     return '<div class="delivery-card '+(isDone?'card-done':'card-pending')+'" id="dc-'+idx+'">'
       +'<div class="card-head">'
         +'<span class="drag-handle" draggable="true" onmousedown="startDrag(event,'+idx+')">&#8942;&#8942;</span>'+'<span class="card-num">#'+(pos+1)+'</span>'
-        +'<span class="card-addr-preview">'+(s.clientName||s.addr||'<em style="opacity:.4">klient lub adres…</em>')+'</span>'
+        +'<span class="card-addr-preview">'+(s.clientName||s.addr?esc(s.clientName||s.addr):'<em style="opacity:.4">klient lub adres…</em>')+'</span>'
         +(s.cash?'<span class="cash-badge" style="font-size:10px">💵</span>':'')
         +'<span class="prio-badge '+(pr==='high'?'high':'normal')+'">'+(pr==='high'?'▲':'●')+'</span>'
         +(s.addr?'<span class="card-status '+(hasGeo?'ok':'warn')+'">'+(hasGeo?'✓':'?')+'</span>':'')+(checked[idx]&&typeof checked[idx]==='string'?'<span style="font-family:var(--mono);font-size:11px;padding:3px 8px;border-radius:10px;background:#16a34a;color:#fff;font-weight:600">✓ '+checked[idx]+'</span>':'')
@@ -779,7 +795,8 @@ function renderDispatcher(){
         +'<button class="btn-remove-card" onclick="removeStop('+idx+')">×</button>'
       +'</div>'
       +'<div class="card-body">'
-        +'<div class="field full"><label>Klient / adres *</label>'
+        +'<div class="field full"><div class="client-field-heading"><label for="addr-inp-'+idx+'">Klient / adres *</label>'
+          +'<button type="button" class="btn btn-outline btn-xs stop-client-edit" onclick="openStopClientEditor('+idx+')">'+(s.clientName||s.addr?'✎ Edytuj klienta':'＋ Dodaj klienta')+'</button></div>'
           +'<div class="autocomplete-wrap">'
             +'<input class="addr-input" type="text" id="addr-inp-'+idx+'" value="'+esc(s.clientName||s.addr)+'" placeholder="Wpisz nazwę klienta lub adres…" autocomplete="off"'
               +' oninput="onAddrInput('+idx+',this.value)" onblur="hideAc('+idx+');saveTypedAddr('+idx+',this.value)" onfocus="onAddrInput('+idx+',this.value)">'
@@ -1038,9 +1055,109 @@ var clientEditIdx = null; // null=nowy, number=edit
 var clientEditSnapshot = null;
 var clientListSnapshot = [];
 var clientSaveInProgress = false;
+var clientStopContext = null;
+var clientFormId = null;
+var stopClientChoices = [];
+
+function clientMatchText(value) { return String(value || '').trim().replace(/\s+/g, ' ').toLowerCase(); }
+function newClientId() {
+  return 'client-' + (window.crypto && typeof window.crypto.randomUUID === 'function' ? window.crypto.randomUUID() : Date.now().toString(36) + '-' + Math.random().toString(36).slice(2));
+}
+function stopClientSelection(stop) {
+  return clientsSignature({clientId:stop.clientId || null, name:stop.clientName || '', addr:stop.addr || '', phone:stop.phone || ''});
+}
+function stopClientContextValid(context) {
+  return context && document.getElementById('delivery-date').value === context.date && stops.indexOf(context.stop) !== -1 && stopClientSelection(context.stop) === context.selection;
+}
+
+function openStopClientEditor(idx) {
+  if (clientSaveInProgress || !stops[idx]) return;
+  var stop = stops[idx];
+  var input = document.getElementById('addr-inp-' + idx);
+  var query = (input ? input.value : stop.clientName || stop.addr || '').trim();
+  var db = getClientsDB();
+  var stillSelected = clientMatchText(query) === clientMatchText(stop.clientName || stop.addr);
+  clientStopContext = {date:document.getElementById('delivery-date').value, stop:stop, selection:stopClientSelection(stop)};
+  clientEditIdx = null;
+  clientListSnapshot = db;
+  clientEditSnapshot = clientsSignature(db);
+  document.getElementById('client-modal').classList.add('open');
+  var matches = [];
+  db.forEach(function(c, i) {
+    if (stillSelected && stop.clientId && c.clientId === stop.clientId) matches.push(i);
+  });
+  var unresolvedLink = stillSelected && stop.clientId && !matches.length;
+  if (!matches.length && query) {
+    db.forEach(function(c, i) { if (clientMatchText(c.name) === clientMatchText(query)) matches.push(i); });
+  }
+  if (matches.length > 1 && stillSelected && stop.clientName) {
+    var byAddress = matches.filter(function(i) { return stop.addr && clientMatchText(db[i].addr) === clientMatchText(stop.addr); });
+    if (byAddress.length) matches = byAddress;
+    var byPhone = matches.filter(function(i) { return stop.phone && String(db[i].phone || '').replace(/\D/g, '') === String(stop.phone).replace(/\D/g, ''); });
+    if (byPhone.length) matches = byPhone;
+  }
+  stopClientChoices = matches;
+  if (matches.length === 1 && !unresolvedLink) { chooseStopClient(matches[0]); return; }
+  if (matches.length > 1 || (unresolvedLink && matches.length)) {
+    document.getElementById('client-modal-title').textContent = 'Wybierz kartę klienta';
+    document.getElementById('client-modal-body').innerHTML =
+      '<p class="client-form-context">' + (unresolvedLink ? 'Poprzednio przypisana karta nie jest już dostępna. Wybierz właściwą kartę klienta według adresu i telefonu.' : 'Kilku klientów ma tę nazwę. Wybierz właściwą kartę według adresu i telefonu.') + '</p>'
+      + '<div id="stop-client-matches">' + matches.map(function(i) {
+        var c = db[i];
+        return '<button type="button" class="btn btn-outline client-match-choice" onclick="chooseStopClient(' + i + ')"><strong>' + esc(c.name) + '</strong><span>' + esc(c.addr || 'Brak adresu') + '</span><span>' + esc(c.phone || 'Brak telefonu') + '</span></button>';
+      }).join('') + '</div>';
+    document.querySelector('#client-modal .modal-actions').innerHTML = '<button class="btn btn-outline btn-sm" onclick="closeClientModal()">Anuluj</button>';
+    return;
+  }
+  showClientForm({name:query, addr:stillSelected && stop.clientName ? stop.addr : '', phone:stillSelected ? stop.phone : '', city:''});
+}
+
+function chooseStopClient(i) {
+  if (clientSaveInProgress || !clientStopContext || stopClientChoices.indexOf(i) === -1) return;
+  if (clientsSignature(getClientsDB()) !== clientEditSnapshot || !stopClientContextValid(clientStopContext)) {
+    closeClientModal();
+    toast('Dane zmieniły się. Otwórz kartę klienta ponownie.');
+    return;
+  }
+  clientEditIdx = i;
+  showClientForm(clientListSnapshot[i]);
+}
+
+function showStopClientPending(context) {
+  clientStopContext = context;
+  clientEditSnapshot = null;
+  document.getElementById('client-modal-title').textContent = 'Klient zapisany';
+  document.getElementById('client-modal-body').innerHTML = '<div id="client-save-error" role="alert" style="color:var(--red);font-size:14px;line-height:1.6">Karta klienta została zapisana w bazie. Nie udało się jeszcze zapisać zmiany w planie dostaw. Ponów zapis dostawy po odzyskaniu połączenia.</div>';
+  document.querySelector('#client-modal .modal-actions').innerHTML = '<button class="btn btn-outline btn-sm" onclick="closeClientModal()">Zamknij</button><button class="btn btn-primary btn-sm" id="retry-stop-client-save" onclick="retryStopClientSave()">Ponów zapis dostawy</button>';
+}
+
+async function saveStopClientPlan(context) {
+  if (!stopClientContextValid(context)) return false;
+  try { return await saveDay(); }
+  catch(e) { updateSyncStatus(false); console.warn('client delivery save failed:', e); return false; }
+}
+
+async function retryStopClientSave() {
+  if (clientSaveInProgress) return;
+  var context = clientStopContext;
+  if (!stopClientContextValid(context)) {
+    closeClientModal();
+    toast('Klient zapisany. Otwórz ponownie dostawę, aby odświeżyć jej dane.');
+    return;
+  }
+  setClientSaving(true);
+  var saved = await saveStopClientPlan(context);
+  setClientSaving(false);
+  if (saved) {
+    if (stopClientContextValid(context)) renderDispatcher();
+    closeClientModal();
+    toast('Klient i dostawa zapisani ✓');
+  } else { showStopClientPending(context); }
+}
 
 function openClientManager() {
   if (clientSaveInProgress) return;
+  clientStopContext = null;
   showClientList();
   document.getElementById('client-modal').classList.add('open');
 }
@@ -1048,6 +1165,9 @@ function closeClientModal() {
   if (clientSaveInProgress) return;
   clientEditIdx = null;
   clientEditSnapshot = null;
+  clientStopContext = null;
+  clientFormId = null;
+  stopClientChoices = [];
   document.getElementById('client-modal').classList.remove('open');
 }
 document.getElementById('client-modal').addEventListener('click', function(e){ if(e.target===this) closeClientModal(); });
@@ -1056,6 +1176,8 @@ function showClientList() {
   if (clientSaveInProgress) return;
   clientEditIdx = null;
   clientEditSnapshot = null;
+  clientStopContext = null;
+  clientFormId = null;
   document.getElementById('client-modal-title').textContent = 'Baza klientów';
   var db = getClientsDB();
   clientListSnapshot = db;
@@ -1088,6 +1210,7 @@ function filterClientList(q) {
 
 function openNewClient() {
   if (clientSaveInProgress) return;
+  clientStopContext = null;
   clientEditIdx = null;
   clientEditSnapshot = clientsSignature(getClientsDB());
   showClientForm({name:'', addr:'', city:'', phone:''});
@@ -1105,6 +1228,7 @@ function openEditClient(i) {
 }
 function showClientForm(c) {
   c = Object.assign({}, c);
+  clientFormId = c.clientId || newClientId();
   /* Rozparsuj stary addr na pola jeśli brak street */
   if (!c.street && c.addr) {
     var parts = c.addr.match(/^(.+?),\s*(\d{2}-\d{3})\s+(.+)$/);
@@ -1115,9 +1239,10 @@ function showClientForm(c) {
       else { c.street=c.addr; }
     }
   }
-  document.getElementById('client-modal-title').textContent = clientEditIdx === null ? 'Nowy klient' : 'Edytuj klienta';
+  document.getElementById('client-modal-title').textContent = clientEditIdx === null ? (clientStopContext ? 'Dodaj klienta do bazy' : 'Nowy klient') : 'Edytuj klienta';
   document.getElementById('client-modal-body').innerHTML =
-    '<div class="field" style="margin-bottom:.75rem"><label>Nazwa firmy / klienta *</label>'
+    (clientStopContext ? '<p class="client-form-context">Zapisz stałe dane klienta w bazie i na tej dostawie. Adres jednorazowy pozostanie zachowany.</p>' : '')
+    + '<div class="field" style="margin-bottom:.75rem"><label>Nazwa firmy / klienta *</label>'
     + '<input type="text" id="cf-name" value="' + esc(c.name||'') + '" placeholder="np. MK Meble"></div>'
     + '<div class="field" style="margin-bottom:.75rem"><label>Adres</label>'
     +'<div style="display:grid;grid-template-columns:1fr 100px 1fr;gap:6px">'
@@ -1130,9 +1255,9 @@ function showClientForm(c) {
     + '<div class="field"><label>Telefon</label>'
     + '<input type="text" id="cf-phone" value="' + esc(c.phone||'') + '" placeholder="600 000 000"></div>'
     + '<div id="client-save-error" role="alert" style="display:none;margin-top:.75rem;color:var(--red);font-size:13px"></div>'
-    + (clientEditIdx !== null ? '<div style="margin-top:.875rem"><button class="btn btn-danger btn-xs" onclick="deleteClient()">Usuń tego klienta</button></div>' : '');
+    + (clientEditIdx !== null && !clientStopContext ? '<div style="margin-top:.875rem"><button class="btn btn-danger btn-xs" onclick="deleteClient()">Usuń tego klienta</button></div>' : '');
   document.querySelector('#client-modal .modal-actions').innerHTML =
-    '<button class="btn btn-outline btn-sm" onclick="showClientList()">← Powrót</button>'
+    (clientStopContext ? '<button class="btn btn-outline btn-sm" onclick="closeClientModal()">Anuluj</button>' : '<button class="btn btn-outline btn-sm" onclick="showClientList()">← Powrót</button>')
     + '<button class="btn btn-primary btn-sm" id="client-save-btn" onclick="saveClient()">Zapisz</button>';
 }
 
@@ -1163,14 +1288,42 @@ async function saveClient() {
   setClientSaving(true);
   document.getElementById('client-save-error').style.display = 'none';
   try {
+    var stopContext = clientStopContext;
+    if (stopContext && !stopClientContextValid(stopContext)) {
+      throw clientDataError('Wybrana dostawa zmieniła się podczas edycji. Zamknij formularz i otwórz kartę ponownie.');
+    }
     var base = getClientsDB();
     if (clientsSignature(base) !== clientEditSnapshot) {
       throw clientDataError('Lista klientów zmieniła się podczas edycji. Wróć do listy i ponownie otwórz formularz.');
     }
     var db = base.slice();
-    var c = Object.assign({}, clientEditIdx === null ? {} : base[clientEditIdx], {name:name, addr:addr, street:street, zip:zip, city:city, phone:document.getElementById('cf-phone').value.trim()});
+    var c = Object.assign({}, clientEditIdx === null ? {} : base[clientEditIdx], {clientId:clientFormId, name:name, addr:addr, street:street, zip:zip, city:city, phone:document.getElementById('cf-phone').value.trim()});
     if (clientEditIdx === null) db.unshift(c); else db[clientEditIdx] = c;
     await saveClientsDB(db, base);
+    if (stopContext) {
+      if (!stopClientContextValid(stopContext)) {
+        setClientSaving(false);
+        closeClientModal();
+        toast('Klient zapisany. Otwórz ponownie dostawę, aby odświeżyć jej dane.');
+        return;
+      }
+      var stop = stopContext.stop;
+      var previousAddress = (stop.addrOverride || stop.addr || '').trim();
+      stop.clientId = c.clientId;
+      stop.clientName = c.name;
+      stop.addr = c.addr;
+      stop.phone = c.phone;
+      if (previousAddress !== (stop.addrOverride || stop.addr || '').trim()) { stop.lat = null; stop.lng = null; }
+      stopContext.selection = stopClientSelection(stop);
+      var daySaved = await saveStopClientPlan(stopContext);
+      setClientSaving(false);
+      if (stopClientContextValid(stopContext)) renderDispatcher();
+      if (daySaved) {
+        closeClientModal();
+        toast('Klient i dostawa zapisani ✓');
+      } else { showStopClientPending(stopContext); }
+      return;
+    }
     setClientSaving(false);
     toast('Klient zapisany ✓');
     showClientList();
@@ -1453,13 +1606,14 @@ async function toggleCash(idx, val) {
 
 
 async function saveTypedAddr(idx, val) {
+  if (!stops[idx]) return;
   val = val.trim();
-  if (!val) return;
-  /* Jeśli użytkownik wybrał z autocomplete (pickClient), clientName jest ustawione — nie nadpisuj */
-  if (stops[idx].clientName && stops[idx].addr) return;
+  if (clientMatchText(val) === clientMatchText(stops[idx].clientName || stops[idx].addr)) return;
   /* Ręcznie wpisany adres — traktuj jako adres bez klienta z bazy */
   stops[idx].addr = val;
   stops[idx].clientName = '';
+  stops[idx].phone = '';
+  delete stops[idx].clientId;
   stops[idx].lat = null;
   stops[idx].lng = null;
   await saveDay();
