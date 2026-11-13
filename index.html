@@ -240,6 +240,29 @@ nav{background:var(--nav-bg);padding:0 1rem;display:flex;align-items:center;gap:
 
 .delivery-card.drag-over{border-top:3px solid var(--accent)}
 
+
+/* Historia wizyt i niezależne wyszukiwanie okolicy. */
+.client-visit-summary{background:var(--accent-soft);border:1px solid var(--border);border-radius:8px;padding:9px 11px;overflow-wrap:anywhere}
+.client-visit-summary strong,.client-visit-compact strong{color:var(--text2);font-family:var(--mono)}
+.client-visit-compact{overflow-wrap:anywhere}
+.visit-history-status{font-size:11px;line-height:1.5;color:var(--muted);margin:4px 0 10px}
+.client-row-details{flex:1;min-width:0}
+.client-row-details .client-row-name{display:block;overflow-wrap:anywhere}
+.client-row-details .client-row-addr{display:block;white-space:normal;overflow-wrap:anywhere;margin-top:3px}
+.client-list.with-visits{max-height:55vh}
+.nearby-result{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px;margin-top:8px}
+.nearby-result-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;font-size:13px}
+.nearby-result-head strong{min-width:0;overflow-wrap:anywhere}
+.nearby-result-head .nearby-dist{white-space:nowrap;flex:none;color:var(--accent)}
+.nearby-result-address{font-size:12px;color:var(--muted);line-height:1.5;overflow-wrap:anywhere;margin-top:4px}
+.nearby-result-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:7px}
+.nearby-planned{font-size:11px;color:var(--green)}
+.nearby-status,.nearby-error{font-size:12px;line-height:1.6;margin:6px 0;overflow-wrap:anywhere}
+.nearby-status{color:var(--muted)}.nearby-error{color:var(--red)}
+.nearby-source{font-size:10px;line-height:1.5;color:var(--muted);margin-top:10px}.nearby-source a{color:var(--muted)}
+.stats-clients-note{font-size:12px;color:var(--muted);line-height:1.6;margin:0 0 10px}
+.stat-table .client-visit-compact{min-width:0}.stat-table td{overflow-wrap:anywhere}
+
 /* ══ TOAST ══ */
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
 .optimizing{animation:pulse .8s infinite}
@@ -417,14 +440,93 @@ async function supaFetch(path, method, body, timeoutMs, preference) {
   } finally { clearTimeout(timer); }
 }
 
-async function loadAllDatesFromCloud() {
-  var rows = await supaFetch('delivery_plans?select=date,stops,order,checked', 'GET', null);
-  if (!rows) return;
-  rows.forEach(function(r) {
-    localStorage.setItem(storageKey(r.date), JSON.stringify({stops:r.stops,order:r.order||[],checked:r.checked||{}}));
-  });
+var visitHistorySyncedAt = 0;
+var visitHistoryError = '';
+var visitHistoryRefresh = null;
+var currentPlanRefreshRequired = false;
+
+function showPlanRefreshWarning() {
+  var box = document.getElementById('plan-refresh-warning');
+  if (!box) {
+    box = document.createElement('div'); box.id = 'plan-refresh-warning'; box.className = 'client-form-context'; box.setAttribute('role','alert');
+    var anchor = document.getElementById('deliveries-list');
+    if (anchor) anchor.parentNode.insertBefore(box,anchor);
+  }
+  box.innerHTML = 'Plan zmienił się na innym urządzeniu. Wczytaj aktualną wersję przed kolejną zmianą. <button type="button" class="btn btn-outline btn-xs" onclick="reloadCurrentPlan()">Wczytaj aktualny plan</button>';
+  box.style.display = '';
+}
+async function reloadCurrentPlan() {
+  await loadDay(document.getElementById('delivery-date').value);
+  if (currentPlanRefreshRequired) { toast('Nie udało się odświeżyć planu. Sprawdź połączenie.'); return; }
+  renderDispatcher(); renderDriver(); renderCalendar();
+  var box = document.getElementById('plan-refresh-warning'); if (box) box.style.display='none';
 }
 
+async function loadAllDatesFromCloud() {
+  var before = {}, allRows = [], offset = 0, rows;
+  var selectedDate = document.getElementById('delivery-date').value;
+  var currentSnapshot = clientsSignature({stops:stops,order:order,checked:checked});
+  for (var i = 0; i < localStorage.length; i++) {
+    var key = localStorage.key(i);
+    if (key && /^delivery_\d{4}-\d{2}-\d{2}$/.test(key)) before[key] = localStorage.getItem(key);
+  }
+  do {
+    rows = await supaFetch('delivery_plans?select=date,stops,order,checked&order=date.asc&limit=1000&offset=' + offset, 'GET', null, 15000);
+    if (!Array.isArray(rows)) throw new Error('Nie udało się pobrać historii dostaw.');
+    allRows = allRows.concat(rows); offset += rows.length;
+  } while (rows.length === 1000);
+  allRows.forEach(function(r) {
+    var key = storageKey(r.date);
+    // A response must not replace a delivery edited locally while the request was running.
+    if (localStorage.getItem(key) === (Object.prototype.hasOwnProperty.call(before,key) ? before[key] : null)) {
+      localStorage.setItem(key, JSON.stringify({stops:r.stops,order:r.order||[],checked:r.checked||{}}));
+      if (r.date === selectedDate && document.getElementById('delivery-date').value === selectedDate
+          && clientsSignature({stops:stops,order:order,checked:checked}) === currentSnapshot) {
+        if (clientsSignature({stops:stops,order:order}) === clientsSignature({stops:r.stops,order:r.order||[]})) {
+          checked = r.checked || {};
+        } else if (before[key] != null) {
+          currentPlanRefreshRequired = true;
+          showPlanRefreshWarning();
+        }
+      }
+    }
+  });
+  visitHistorySyncedAt = Date.now(); visitHistoryError = '';
+}
+
+function visitHistoryNotice() {
+  if (visitHistoryError) return 'Historia z lokalnej kopii. Nie udało się odświeżyć danych z innych urządzeń.';
+  if (!visitHistorySyncedAt) return 'Pobieranie historii dostaw…';
+  return 'Potwierdzone dostawy • odświeżono ' + new Date(visitHistorySyncedAt).toLocaleTimeString('pl-PL',{hour:'2-digit',minute:'2-digit'});
+}
+function refreshClientVisitDisplays() {
+  var index = buildClientVisitIndex();
+  document.querySelectorAll('.stop-visit-summary').forEach(function(el){
+    var stop = stops[Number(el.dataset.stopIndex)];
+    if (stop) el.innerHTML = renderClientVisitSummary(stop, index);
+  });
+  document.querySelectorAll('.visit-history-status').forEach(function(el){el.textContent=visitHistoryNotice();});
+  if (document.getElementById('client-search') && clientEditSnapshot === null) filterClientList(document.getElementById('client-search').value);
+  document.querySelectorAll('.nearby-panel').forEach(function(el){
+    if (nearbyStateCurrent(el._nearbyState)) { el._nearbyState.visits=index; renderNearbyResults(el._nearbyState); }
+  });
+}
+async function refreshVisitHistory(force) {
+  if (visitHistoryRefresh) return visitHistoryRefresh;
+  if (!force && Date.now() - visitHistorySyncedAt < 60000) return true;
+  visitHistoryRefresh = (async function(){
+    try {
+      var saved = await daySaveQueue;
+      if (saved === false) throw new Error('Plan ma niezapisane zmiany lokalne.');
+      await loadAllDatesFromCloud();
+      await syncClientsFromCloud();
+      return true;
+    } catch(e) { visitHistoryError = e.message || 'Brak połączenia.'; return false; }
+    finally { refreshClientVisitDisplays(); }
+  })();
+  try { return await visitHistoryRefresh; }
+  finally { visitHistoryRefresh = null; }
+}
 async function syncClientsFromCloud() {
   var before = localStorage.getItem('clientsDB');
   var row = await readClientsFromCloud();
@@ -492,27 +594,39 @@ document.addEventListener('DOMContentLoaded', async function() {
     await syncClientsFromCloud();
     await loadDay(inp.value);
     renderDispatcher(); renderCalendar(); updateSyncStatus(true);
-  } catch(e) { updateSyncStatus(false); console.warn('init sync:', e); }
+  } catch(e) { visitHistoryError = e.message || 'Brak połączenia.'; updateSyncStatus(false); console.warn('init sync:', e); }
+  refreshClientVisitDisplays();
 });
 
 function todayStr() { return new Date().toLocaleDateString('sv'); }
 function storageKey(d) { return 'delivery_' + d; }
 
+var dayLoadRequest = 0;
 async function loadDay(date) {
+  var requestId = ++dayLoadRequest;
+  if (document.getElementById('delivery-date').value !== date) return false;
   var raw = localStorage.getItem(storageKey(date));
-  if (raw) { var s=JSON.parse(raw); stops=s.stops||[]; order=s.order||stops.map(function(_,i){return i;}); checked=s.checked||{}; }
+  if (raw) { var snapshot=JSON.parse(raw); stops=snapshot.stops||[]; order=snapshot.order||stops.map(function(_,i){return i;}); checked=snapshot.checked||{}; }
   else { stops=[]; order=[]; checked={}; }
   try {
-    var rows = await supaFetch('delivery_plans?date=eq.'+date+'&select=stops,order,checked', 'GET', null);
-    if (rows && rows.length) {
-      var d=rows[0]; stops=d.stops||[]; order=d.order||stops.map(function(_,i){return i;}); checked=d.checked||{};
-      localStorage.setItem(storageKey(date), JSON.stringify({stops:stops,order:order,checked:checked}));
-      updateSyncStatus(true);
+    var rows=await supaFetch('delivery_plans?date=eq.'+date+'&select=stops,order,checked','GET',null,15000);
+    if (requestId !== dayLoadRequest || document.getElementById('delivery-date').value !== date) return false;
+    if (!Array.isArray(rows)) throw new Error('Nie udało się pobrać planu.');
+    if (rows.length) {
+      var data=rows[0]; stops=data.stops||[]; order=data.order||stops.map(function(_,i){return i;}); checked=data.checked||{};
+      localStorage.setItem(storageKey(date),JSON.stringify({stops:stops,order:order,checked:checked}));
     }
-  } catch(e) { updateSyncStatus(false); console.warn('load failed:',e); }
+    currentPlanRefreshRequired=false;
+    var warning=document.getElementById('plan-refresh-warning'); if(warning)warning.style.display='none';
+    updateSyncStatus(true); return true;
+  } catch(e) { if(requestId===dayLoadRequest)updateSyncStatus(false); console.warn('load failed:',e); return false; }
 }
 var daySaveQueue = Promise.resolve();
 async function saveDay() {
+  if (currentPlanRefreshRequired) {
+    localStorage.setItem('delivery_draft_'+document.getElementById('delivery-date').value,JSON.stringify({stops:stops,order:order,checked:checked}));
+    showPlanRefreshWarning(); toast('Zachowano lokalny szkic. Wczytaj aktualny plan i ponów zmianę.'); return false;
+  }
   var date = document.getElementById('delivery-date').value;
   var payload = JSON.parse(JSON.stringify({stops:stops, order:order, checked:checked}));
   localStorage.setItem(storageKey(date), JSON.stringify(payload));
@@ -567,8 +681,18 @@ async function addStop() {
   await saveDay(); renderDispatcher();
   setTimeout(function(){var a=document.querySelectorAll('.addr-input');if(a.length)a[a.length-1].focus();},80);
 }
+function checkedAfterRemoving(index) {
+  var next = {};
+  Object.keys(checked).forEach(function(key){
+    if (!/^\d+$/.test(key)) { next[key] = checked[key]; return; }
+    var oldIndex = Number(key);
+    if (oldIndex !== index) next[oldIndex > index ? oldIndex - 1 : oldIndex] = checked[key];
+  });
+  return next;
+}
 async function removeStop(idx) {
-  stops.splice(idx,1); order=stops.map(function(_,i){return i;}); checked={};
+  checked = checkedAfterRemoving(idx);
+  stops.splice(idx,1); order=stops.map(function(_,i){return i;});
   await saveDay(); renderDispatcher();
 }
 async function updateStop(idx, field, val) {
@@ -660,35 +784,35 @@ function nearestNeighbor(pts, startPoint){
   return{route:route, lastPoint:cur};
 }
 async function geocode(addr){
-  if(!addr.trim())return null;
-  var url='https://nominatim.openstreetmap.org/search?q='+encodeURIComponent(addr+', Polska')+'&format=json&limit=1&countrycodes=pl';
-  try{
-    var controller=new AbortController();
-    var timer=setTimeout(function(){controller.abort();},8000);
-    var r=await fetch(url,{headers:{'Accept-Language':'pl'},signal:controller.signal});
-    clearTimeout(timer);
-    var d=await r.json();
-    if(d&&d[0])return{lat:parseFloat(d[0].lat),lng:parseFloat(d[0].lon)};
-  }catch(e){console.warn('Geocode timeout/error:',addr,e);}
-  return null;
+  await daySaveQueue;
+  var row = await lookupAddressLocation(addr, true);
+  return validAddressLocation(row) ? {lat:row.lat,lng:row.lng} : null;
 }
 async function optimizeRoute(){
   var btn=document.getElementById('btn-optimize');
   if(!stops.length){toast('Dodaj najpierw przystanki.');return;}
   btn.textContent='⏳ Geokodowanie…'; btn.classList.add('optimizing'); btn.disabled=true;
   var toGeo = stops.filter(function(s,i){ return !s.lat && (s.addrOverride||s.addr||'').trim(); }).length;
-  var geoIdx = 0;
-  for(var i=0;i<stops.length;i++){
-    var geoAddr = (stops[i].addrOverride||stops[i].addr||'').trim();
-    if(!stops[i].lat && geoAddr){
-      geoIdx++;
-      btn.textContent='⏳ Geokodowanie '+geoIdx+'/'+toGeo+'…';
-      try {
-        var geo=await geocode(geoAddr); if(geo){stops[i].lat=geo.lat;stops[i].lng=geo.lng;}
-      } catch(e){ console.warn('Geo failed for:',geoAddr,e); }
-      await new Promise(function(r){setTimeout(r,350);});
+  var geoIdx = 0, pendingGeo = [];
+  try {
+    for(var i=0;i<stops.length;i++){
+      var stop = stops[i], geoAddr = (stop.addrOverride||stop.addr||'').trim();
+      if(!stop.lat && geoAddr){
+        geoIdx++;
+        btn.textContent='⏳ Geokodowanie '+geoIdx+'/'+toGeo+'…';
+        var geo=await geocode(geoAddr);
+        if(geo) pendingGeo.push({stop:stop, address:geoAddr, geo:geo});
+        await new Promise(function(r){setTimeout(r,350);});
+      }
     }
+  } catch(e) {
+    btn.textContent='⚡ Optymalizuj trasę'; btn.classList.remove('optimizing'); btn.disabled=false;
+    var message = e && e.status === 400 && e.message ? e.message : 'Usługa lokalizacji jest niedostępna. Sprawdź połączenie i spróbuj ponownie.';
+    toast('⚠ Optymalizacja przerwana. '+message+' Plan pozostaje bez zmian.');
+    return;
   }
+  /* Zastosuj współrzędne dopiero po odczytach bez błędu usługi. */
+  pendingGeo.forEach(function(result){ result.stop.lat=result.geo.lat; result.stop.lng=result.geo.lng; result.stop.geoAddressKey=clientAddressKey(result.address); });
   btn.textContent='⏳ Optymalizacja…';
   /* Sortuj priorytetami; w każdej grupie: nearest-neighbor + 2-opt */
   var groups={'high':[],'normal':[]};
@@ -711,7 +835,7 @@ async function optimizeRoute(){
       if(lp) lastPoint=lp;
     }
   });
-  checked={}; await saveDay();
+  await saveDay();
   btn.textContent='⚡ Optymalizuj trasę'; btn.classList.remove('optimizing'); btn.disabled=false;
   /* Zapisz szacunkowe km */
   var km=estimateKm(); if(km) localStorage.setItem('km_'+document.getElementById('delivery-date').value, String(km));
@@ -777,6 +901,7 @@ function renderDispatcher(){
   var addBtn=document.getElementById('add-stop-bottom');
   if(!stops.length){list.innerHTML='';empty.style.display='';if(addBtn)addBtn.style.display='none';document.getElementById('route-bar').style.display='none';document.getElementById('stats-pill').style.display='none';return;}
   empty.style.display='none'; if(addBtn)addBtn.style.display=''; updateStatsRoute();
+  var visitIndex = buildClientVisitIndex();
   var displayOrder=order.length===stops.length?order:stops.map(function(_,i){return i;});
   list.innerHTML=displayOrder.map(function(idx,pos){
     var s=stops[idx];
@@ -805,6 +930,7 @@ function renderDispatcher(){
           +(s.clientName?'<div style="font-size:11px;color:var(--muted);margin-top:3px;font-family:var(--mono)">📍 '+esc(s.addr)+'</div>':'')
           +(s.phone?'<div style="font-size:11px;color:var(--accent);margin-top:2px;font-family:var(--mono)">📞 '+esc(s.phone)+'</div>':'')
         +'</div>'
+        +((s.clientName||s.addr)?'<div class="field full"><div class="stop-visit-summary" data-stop-index="'+idx+'">'+renderClientVisitSummary(s,visitIndex)+'</div></div>':'')
         +'<div class="field full"><label>Uwagi (towar, piętro, kod, inne)</label>'
           +'<textarea rows="2" style="min-height:54px;resize:vertical" onchange="updateStop('+idx+',\'note\',this.value)">'+(esc(s.goods)||esc(s.note)||'')+'</textarea>'
         +'</div>'
@@ -850,6 +976,7 @@ async function updateAddrPart(idx, field, val) {
   stops[idx].lat = null; stops[idx].lng = null;
   await saveDay();
   updateStatsRoute();
+  invalidateNearbyForStop(idx);
 }
 
 function updateStatsRoute(){
@@ -875,7 +1002,7 @@ function updateStatsRoute(){
   var km=estimateKm();
   var geoN=stops.filter(function(s){return s.lat;}).length;
   ri.innerHTML=geoN?('<strong>'+n+' przystanków</strong>'+(km?' · ~<strong>'+km+' km</strong>':'')+' · z Błonia i powrót'+(n>9?' · <span style="color:var(--gold)">⚠ trasa podzielona na etapy</span>':''))
-               :('<strong>'+n+' przystanków</strong> · kliknij Optymalizuj');
+               :('<strong>'+n+' przystanków</strong> · kolejność według planu');
   ml.href=buildMapsUrl();
 }
 
@@ -1160,6 +1287,7 @@ function openClientManager() {
   clientStopContext = null;
   showClientList();
   document.getElementById('client-modal').classList.add('open');
+  refreshVisitHistory(false);
 }
 function closeClientModal() {
   if (clientSaveInProgress) return;
@@ -1182,7 +1310,8 @@ function showClientList() {
   var db = getClientsDB();
   clientListSnapshot = db;
   var body = '<input class="client-search" id="client-search" placeholder="Szukaj…" oninput="filterClientList(this.value)">'
-    + '<div class="client-list" id="client-list-inner">'
+    + '<div class="visit-history-status">'+esc(visitHistoryNotice())+'</div>'
+    + '<div class="client-list with-visits" id="client-list-inner">'
     + renderClientRows(db)
     + '</div>'
     + '<button class="btn btn-primary btn-sm" onclick="openNewClient()">＋ Dodaj nowego klienta</button>';
@@ -1193,11 +1322,13 @@ function showClientList() {
 
 function renderClientRows(db, query) {
   var q = (query || '').trim().toLowerCase();
+  var visitIndex = buildClientVisitIndex({clients:db});
   var rows = db.map(function(c, i) {
     if (q && ![c.name, c.addr, c.city, c.phone].join(' ').toLowerCase().includes(q)) return '';
     return '<div class="client-row">'
-      + '<span class="client-row-name">' + esc(c.name) + '</span>'
+      + '<div class="client-row-details"><span class="client-row-name">' + esc(c.name) + '</span>'
       + '<span class="client-row-addr">' + esc(c.addr) + '</span>'
+      + renderClientVisitSummary(c,visitIndex,{compact:true}) + '</div>'
       + '<button class="btn btn-outline btn-xs" onclick="openEditClient(' + i + ')">Edytuj</button>'
       + '</div>';
   }).join('');
@@ -1254,6 +1385,7 @@ function showClientForm(c) {
     +'</div>'
     + '<div class="field"><label>Telefon</label>'
     + '<input type="text" id="cf-phone" value="' + esc(c.phone||'') + '" placeholder="600 000 000"></div>'
+    + (clientEditIdx !== null ? renderClientVisitSummary(c,buildClientVisitIndex()) : '')
     + '<div id="client-save-error" role="alert" style="display:none;margin-top:.75rem;color:var(--red);font-size:13px"></div>'
     + (clientEditIdx !== null && !clientStopContext ? '<div style="margin-top:.875rem"><button class="btn btn-danger btn-xs" onclick="deleteClient()">Usuń tego klienta</button></div>' : '');
   document.querySelector('#client-modal .modal-actions').innerHTML =
@@ -1298,6 +1430,16 @@ async function saveClient() {
     }
     var db = base.slice();
     var c = Object.assign({}, clientEditIdx === null ? {} : base[clientEditIdx], {clientId:clientFormId, name:name, addr:addr, street:street, zip:zip, city:city, phone:document.getElementById('cf-phone').value.trim()});
+    if (clientEditIdx !== null) {
+      var previousClient = base[clientEditIdx];
+      var aliases = Array.isArray(previousClient._visitAliases) ? previousClient._visitAliases.slice() : [];
+      if (clientMatchText(previousClient.name) !== clientMatchText(c.name) || clientAddressKey(previousClient.addr) !== clientAddressKey(c.addr)) {
+        if (!aliases.some(function(a){return clientMatchText(a.name)===clientMatchText(previousClient.name) && clientAddressKey(a.addr)===clientAddressKey(previousClient.addr);})) {
+          aliases.push({name:previousClient.name || '',addr:previousClient.addr || ''});
+        }
+      }
+      if (aliases.length) c._visitAliases = aliases;
+    }
     if (clientEditIdx === null) db.unshift(c); else db[clientEditIdx] = c;
     await saveClientsDB(db, base);
     if (stopContext) {
@@ -1357,7 +1499,11 @@ function switchView(v){
   document.getElementById('view-'+v).classList.add('active');
   document.querySelector('.nav-tab[onclick*="'+v+'"]').classList.add('active');
   if(v==='driver')renderDriver();
-  if(v==='stats')renderStats();
+  if(v==='dispatcher')refreshClientVisitDisplays();
+  if(v==='stats'){
+    renderStats();
+    refreshVisitHistory(true).then(function(){if(document.getElementById('view-stats').classList.contains('active'))renderStats();});
+  }
 }
 async function clearAll(){
   if(!stops.length)return;
@@ -1367,69 +1513,502 @@ async function clearAll(){
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function toast(msg){var t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(function(){t.classList.remove('show');},2500);}
 
-/* ═══════════════ NEARBY CLIENTS ═══════════════ */
-function toggleNearby(idx) {
-  var panel = document.getElementById('nearby-'+idx);
-  if (!panel) return;
-  if (panel.style.display === 'none' || !panel.style.display) {
-    panel.style.display = '';
-    showNearby(idx, 5);
-  } else {
-    panel.style.display = 'none';
-  }
+/* ═══════════════ HISTORIA WIZYT I OKOLICA ═══════════════ */
+/* Client visit frequency. Build one index per render and reuse it for every row.
+ * Public API:
+ *   buildClientVisitIndex({today?, clients?, plans?, storage?})
+ *   getClientVisitStats(clientOrStopOrClientIndex, index?)
+ *   renderClientVisitSummary(clientOrStopOrClientIndex, index?, {compact?})
+ * Optional plans are raw {date, stops, checked}, before any stop filtering.
+ * _visitAliases on a client is an array of historical {name, addr} pairs.
+ * No network, writes, mutation of clients/stops, inferred completion or route optimization.
+ */
+
+function clientVisitDateNumber(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  var time = Date.parse(value + 'T00:00:00Z');
+  if (!Number.isFinite(time) || new Date(time).toISOString().slice(0, 10) !== value) return null;
+  return Math.floor(time / 86400000);
 }
 
-function showNearby(idx, radiusKm) {
-  var panel = document.getElementById('nearby-'+idx);
-  if (!panel) return;
-  var s = stops[idx];
-  /* Zaktualizuj aktywny przycisk */
-  panel.querySelectorAll('.nearby-radius button').forEach(function(b){
-    b.classList.toggle('active', parseInt(b.dataset.r) === radiusKm);
-  });
-  var listEl = panel.querySelector('.nearby-list');
-  if (!s.lat) {
-    listEl.innerHTML = '<div style="color:var(--muted);font-size:12px">Brak współrzędnych — najpierw kliknij Optymalizuj.</div>';
-    return;
-  }
-  var db = getClientsDB();
-  /* Szukaj klientów z geocodowanymi współrzędnymi w bazie dostaw */
-  var results = [];
-  /* Zbierz wszystkie adresy z bazy klientów i sprawdź distance po haversine */
-  /* Uwaga: CLIENTS nie mają lat/lng — szukamy wśród AKTUALNYCH STOPS z geo */
-  var allStopsGeo = [];
-  for (var k = 0; k < localStorage.length; k++) {
-    var key = localStorage.key(k);
-    if (!key || !key.startsWith('delivery_')) continue;
+function clientVisitDateFromNumber(value) {
+  return new Date(value * 86400000).toISOString().slice(0, 10);
+}
+
+function clientVisitNameKey(value) {
+  var normalized = typeof clientMatchText === 'function' ? clientMatchText(value) : String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
+  return normalized.normalize ? normalized.normalize('NFC') : normalized;
+}
+
+function clientVisitAddressKey(value) {
+  var text = String(value || '');
+  if (typeof clientAddressKey === 'function') return clientAddressKey(text);
+  // Conservative fallback; do not remove apartment numbers, accents or address components.
+  return clientVisitNameKey(text).replace(/\s*,\s*/g, ', ').replace(/\s+/g, ' ').trim();
+}
+
+function clientVisitId(value) {
+  return value == null ? '' : String(value).trim();
+}
+
+function clientVisitIsConfirmed(value) {
+  if (value === true) return true;
+  if (typeof value !== 'string') return false;
+  var text = value.trim();
+  // Existing app stores a time (HH:mm); accept full timestamps for future migrations.
+  return /^(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/.test(text)
+    || (/^\d{4}-\d{2}-\d{2}T/.test(text) && Number.isFinite(Date.parse(text)));
+}
+
+function clientVisitReadPlans(storage) {
+  var plans = [];
+  if (!storage) return plans;
+  for (var i = 0; i < storage.length; i++) {
+    var key = storage.key(i);
+    if (!key || !/^delivery_\d{4}-\d{2}-\d{2}$/.test(key)) continue;
     try {
-      var data = JSON.parse(localStorage.getItem(key));
-      (data.stops||[]).forEach(function(st){
-        if (st.lat && st.addr && st.addr !== s.addr) {
-          allStopsGeo.push({name: st.clientName||st.addr, addr: st.addr, phone: st.phone||'', lat: st.lat, lng: st.lng});
-        }
-      });
-    } catch(e){}
+      var raw = JSON.parse(storage.getItem(key));
+      if (raw && Array.isArray(raw.stops)) plans.push({date:key.slice(9), stops:raw.stops, checked:raw.checked || {}});
+    } catch(e) { /* Ignore corrupt cache entries rather than guessing their contents. */ }
   }
-  /* Deduplikuj po adresie */
-  var seen = {}; var unique = [];
-  allStopsGeo.forEach(function(x){ if(!seen[x.addr]){seen[x.addr]=1;unique.push(x);} });
-  /* Policz odległości i filtruj */
-  results = unique.map(function(c){
-    return {name:c.name, addr:c.addr, phone:c.phone, dist: haversine({lat:s.lat,lng:s.lng},{lat:c.lat,lng:c.lng})};
-  }).filter(function(c){ return c.dist <= radiusKm; })
-    .sort(function(a,b){ return a.dist-b.dist; })
-    .slice(0,12);
-  if (!results.length) {
-    listEl.innerHTML = '<div style="color:var(--muted);font-size:12px">Brak znanych klientów w promieniu '+radiusKm+' km.<br><span style="font-size:11px">Klienci pojawiają się tu po geokodowaniu (Optymalizuj trasę).</span></div>';
+  return plans;
+}
+
+function buildClientVisitIndex(options) {
+  options = options || {};
+  var today = options.today || (typeof todayStr === 'function' ? todayStr() : new Date().toLocaleDateString('sv'));
+  var todayNumber = clientVisitDateNumber(today);
+  if (todayNumber === null) throw new Error('Nieprawidłowa data odniesienia statystyk wizyt.');
+  var clients = Array.isArray(options.clients) ? options.clients : getClientsDB();
+  var storage = options.storage !== undefined ? options.storage : (typeof localStorage === 'undefined' ? null : localStorage);
+  var plans = Array.isArray(options.plans) ? options.plans : clientVisitReadPlans(storage);
+  var byId = new Map(), byPair = new Map(), byAddress = new Map(), byName = new Map();
+  var buckets = new Map(), clientKeys = [], clientReferences = new Map();
+  var diagnostics = {invalidPlans:0, unmatchedStops:0, ambiguousStops:0, futureCheckedStops:0};
+
+  function addMapping(map, key, identity) {
+    if (!key) return;
+    if (!map.has(key)) map.set(key, new Set());
+    map.get(key).add(identity);
+  }
+  function pairKey(name, address) { return name && address ? JSON.stringify([name, address]) : ''; }
+  function ensureBucket(key, knownClient) {
+    if (!buckets.has(key)) buckets.set(key, {
+      key:key, knownClient:!!knownClient, confirmed:new Set(), unconfirmed:new Set(), planned:new Set(),
+      confirmedStops:0, unconfirmedStops:[], plannedStops:0, ambiguousLegacyStops:0
+    });
+    if (knownClient) buckets.get(key).knownClient = true;
+    return buckets.get(key);
+  }
+  function addClientPair(identity, record) {
+    if (!record || typeof record !== 'object') return;
+    var name = clientVisitNameKey(record.name || record.clientName);
+    var address = clientVisitAddressKey(record.addr);
+    addMapping(byPair, pairKey(name, address), identity);
+    addMapping(byAddress, address, identity);
+    addMapping(byName, name, identity);
+  }
+  clients.forEach(function(client, i) {
+    if (!client || typeof client !== 'object') { clientKeys[i] = null; return; }
+    var id = clientVisitId(client.clientId);
+    var identity = id ? 'id:' + id : 'client:' + i;
+    clientKeys[i] = identity;
+    clientReferences.set(client, identity);
+    ensureBucket(identity, true);
+    if (id) byId.set(id, identity);
+    addClientPair(identity, client);
+    (Array.isArray(client._visitAliases) ? client._visitAliases : []).forEach(function(alias) { addClientPair(identity, alias); });
+  });
+
+  function resolve(record, allowReference) {
+    if (typeof record === 'number' && Number.isInteger(record) && clientKeys[record]) return {key:clientKeys[record], basis:'currentClient'};
+    if (!record || typeof record !== 'object') return {key:null, basis:'unmatched'};
+    if (allowReference && clientReferences.has(record)) return {key:clientReferences.get(record), basis:'currentClient'};
+    var id = clientVisitId(record.clientId);
+    // An unknown saved ID remains a separate identity; never silently reassign it by name.
+    if (id) return {key:byId.get(id) || 'id:' + id, basis:'clientId'};
+    var name = clientVisitNameKey(record.clientName || record.name);
+    var address = clientVisitAddressKey(record.addr);
+    var pair = pairKey(name, address);
+    var exact = pair && byPair.get(pair);
+    if (exact && exact.size === 1) return {key:Array.from(exact)[0], basis:'nameAddress'};
+    if (exact && exact.size > 1) return {key:null, basis:'ambiguous', candidates:Array.from(exact)};
+    var addressMatches = address && byAddress.get(address);
+    if (addressMatches && addressMatches.size === 1) {
+      var identity = Array.from(addressMatches)[0];
+      var named = name && byName.get(name);
+      // A known name identifying another client is contradictory evidence, not a rename.
+      if (named && !named.has(identity)) return {key:null, basis:'ambiguous', candidates:Array.from(new Set(Array.from(named).concat([identity])))};
+      return {key:identity, basis:'uniqueAddress'};
+    }
+    if (addressMatches && addressMatches.size > 1) return {key:null, basis:'ambiguous', candidates:Array.from(addressMatches)};
+    // Unregistered historical clients can still have a cautious exact name+address history.
+    if (pair) return {key:'historical:' + pair, basis:'historicalPair'};
+    return {key:null, basis:'unmatched'};
+  }
+
+  // One raw record per date. A deliberately supplied later snapshot replaces the earlier one.
+  var plansByDate = new Map();
+  plans.forEach(function(plan) {
+    if (!plan || clientVisitDateNumber(plan.date) === null || !Array.isArray(plan.stops)) { diagnostics.invalidPlans++; return; }
+    plansByDate.set(plan.date, plan);
+  });
+  plansByDate.forEach(function(plan, date) {
+    var day = clientVisitDateNumber(date);
+    var checked = plan.checked && typeof plan.checked === 'object' ? plan.checked : {};
+    plan.stops.forEach(function(stop, originalIndex) {
+      if (!stop || typeof stop !== 'object') return;
+      var match = resolve(stop, false);
+      if (!match.key) {
+        diagnostics.unmatchedStops++;
+        if (match.basis === 'ambiguous') {
+          diagnostics.ambiguousStops++;
+          if (day <= todayNumber) (match.candidates || []).forEach(function(key) { ensureBucket(key, true).ambiguousLegacyStops++; });
+        }
+        return;
+      }
+      var bucket = ensureBucket(match.key, false);
+      var done = Object.prototype.hasOwnProperty.call(checked, String(originalIndex)) && clientVisitIsConfirmed(checked[originalIndex]);
+      if (day > todayNumber) {
+        bucket.planned.add(date); bucket.plannedStops++;
+        if (done) diagnostics.futureCheckedStops++;
+      } else if (done) {
+        bucket.confirmed.add(date); bucket.confirmedStops++;
+      } else {
+        bucket.unconfirmed.add(date); bucket.unconfirmedStops.push(date);
+      }
+    });
+  });
+
+  function inWindow(date, days) { var age = todayNumber - clientVisitDateNumber(date); return age >= 0 && age < days; }
+  function roundOne(value) { return Math.round(value * 10) / 10; }
+  function summarize(bucket) {
+    var dates = bucket ? Array.from(bucket.confirmed).sort() : [];
+    var dates90 = dates.filter(function(date) { return inWindow(date, 90); });
+    var pending = bucket ? Array.from(bucket.unconfirmed).filter(function(date) { return !bucket.confirmed.has(date); }).sort() : [];
+    var planned = bucket ? Array.from(bucket.planned).sort() : [];
+    var unconfirmedStops = bucket ? bucket.unconfirmedStops : [];
+    var gaps = dates90.slice(1).map(function(date, i) { return clientVisitDateNumber(date) - clientVisitDateNumber(dates90[i]); });
+    var sortedGaps = gaps.slice().sort(function(a, b) { return a - b; });
+    var middle = Math.floor(sortedGaps.length / 2);
+    var typical = !gaps.length ? null : sortedGaps.length % 2 ? sortedGaps[middle] : (sortedGaps[middle - 1] + sortedGaps[middle]) / 2;
+    var last = dates.length ? dates[dates.length - 1] : null;
+    return {
+      key:bucket ? bucket.key : null, knownClient:!!(bucket && bucket.knownClient),
+      today:today, window30Start:clientVisitDateFromNumber(todayNumber - 29), window90Start:clientVisitDateFromNumber(todayNumber - 89),
+      totalVisits:dates.length, visits30:dates.filter(function(d) { return inWindow(d, 30); }).length,
+      visits90:dates90.length,
+      firstVisitDate:dates.length ? dates[0] : null, lastVisitDate:last,
+      daysSinceLastVisit:last ? todayNumber - clientVisitDateNumber(last) : null,
+      averageIntervalDays:gaps.length ? roundOne(gaps.reduce(function(a, b) { return a + b; }, 0) / gaps.length) : null,
+      typicalIntervalDays:typical === null ? null : roundOne(typical),
+      confirmedDates:dates, dates:dates, intervalVisits90:dates90.length,
+      confirmedStops:bucket ? bucket.confirmedStops : 0,
+      unconfirmedDaysTotal:pending.length,
+      unconfirmedDays30:pending.filter(function(d) { return inWindow(d, 30); }).length,
+      unconfirmedDays90:pending.filter(function(d) { return inWindow(d, 90); }).length,
+      unconfirmedStopsTotal:unconfirmedStops.length,
+      unconfirmedStops30:unconfirmedStops.filter(function(d) { return inWindow(d, 30); }).length,
+      unconfirmedStops90:unconfirmedStops.filter(function(d) { return inWindow(d, 90); }).length,
+      futurePlannedDays:planned.length, futurePlannedStops:bucket ? bucket.plannedStops : 0,
+      nextPlannedDate:planned.length ? planned[0] : null,
+      ambiguousLegacyStops:bucket ? bucket.ambiguousLegacyStops : 0
+    };
+  }
+  var summaries = new Map();
+  buckets.forEach(function(bucket, key) { summaries.set(key, summarize(bucket)); });
+  return {
+    today:today, clients:clients, diagnostics:diagnostics,
+    get:function(record) {
+      var match = resolve(record, true);
+      var result = Object.assign({}, match.key && summaries.has(match.key) ? summaries.get(match.key) : summarize(match.key ? ensureBucket(match.key, false) : null));
+      result.matchBasis = match.basis;
+      result.ambiguous = match.basis === 'ambiguous';
+      result.matched = !!match.key;
+      result.confirmedDates = result.confirmedDates.slice();
+      result.dates = result.dates.slice();
+      return result;
+    }
+  };
+}
+
+function getClientVisitStats(clientOrStopOrClientIndex, index) {
+  return (index || buildClientVisitIndex()).get(clientOrStopOrClientIndex);
+}
+
+function renderClientVisitSummary(clientOrStopOrClientIndex, index, options) {
+  options = options || {};
+  var stats = getClientVisitStats(clientOrStopOrClientIndex, index);
+  var compact = !!options.compact;
+  var cssClass = compact ? 'client-visit-compact' : 'client-visit-summary';
+  var style = 'font-size:' + (compact ? '11px' : '12px') + ';color:var(--muted);line-height:1.65;margin-top:5px';
+  if (stats.ambiguous || !stats.matched) return '<div class="' + cssClass + '" style="' + style + '">' + esc(stats.ambiguous ? 'Historia wymaga jednoznacznego przypisania do klienta.' : 'Brak jednoznacznego powiązania z historią wizyt.') + '</div>';
+  function dateLabel(date) { return date ? date.slice(8, 10) + '.' + date.slice(5, 7) + '.' + date.slice(0, 4) : ''; }
+  function numberLabel(value) { return String(value).replace('.', ','); }
+  var lastText = !stats.lastVisitDate ? 'Brak potwierdzonych wizyt w dostępnej historii.'
+    : 'Ostatnia: ' + dateLabel(stats.lastVisitDate) + ' · ' + (stats.daysSinceLastVisit === 0 ? 'dzisiaj' : stats.daysSinceLastVisit === 1 ? 'wczoraj' : stats.daysSinceLastVisit + ' dni temu');
+  var html = '<div class="' + cssClass + '" style="' + style + '">'
+    + '<div>' + (compact ? 'Wizyty' : 'Potwierdzone wizyty') + ': <strong>' + esc(String(stats.visits30)) + '</strong> / 30 dni · <strong>' + esc(String(stats.visits90)) + '</strong> / 90 dni</div>'
+    + '<div>' + esc(lastText) + '</div>';
+  if (stats.averageIntervalDays !== null) {
+    html += '<div title="Średni odstęp między różnymi dniami z potwierdzoną wizytą w ostatnich 90 dniach">Średni odstęp ' + (compact ? '(90 dni)' : 'w 90 dniach') + ': ' + esc(numberLabel(stats.averageIntervalDays)) + ' dni</div>';
+  } else {
+    html += '<div>' + (compact ? 'Średni odstęp (90 dni): za mało wizyt.' : 'Za mało wizyt w ostatnich 90 dniach do wyliczenia odstępu.') + '</div>';
+  }
+  if (!compact && stats.unconfirmedDays90) html += '<div>Dni z planem bez potwierdzenia w ostatnich 90 dniach: ' + esc(stats.unconfirmedDays90) + '</div>';
+  if (!compact && stats.nextPlannedDate) html += '<div>Najbliższy plan: ' + esc(dateLabel(stats.nextPlannedDate)) + '</div>';
+  if (stats.ambiguousLegacyStops) html += '<div>Część starszych wpisów wymaga przypisania do klienta.</div>';
+  if (!compact) html += '<div style="font-size:11px">Jedna wizyta to jeden dzień z potwierdzoną dostawą.</div>';
+  return html + '</div>';
+}
+
+
+/* Lokalizacje adresów są wspólne dla urządzeń i niezależne od kolejności trasy. */
+var addressLocations = Object.create(null);
+var addressLocationsLoaded = false;
+var addressLookupQueue = [];
+var addressLookupPending = Object.create(null);
+var addressLookupRunning = false;
+
+function clientAddressKey(value) {
+  return String(value || '').normalize('NFC').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+function validAddressLocation(row) {
+  return row && row.status === 'resolved' && typeof row.lat === 'number' && typeof row.lng === 'number'
+    && isFinite(row.lat) && isFinite(row.lng) && row.lat >= 49 && row.lat <= 55 && row.lng >= 14 && row.lng <= 25;
+}
+function rememberAddressLocation(row) {
+  if (!row || !row.address_key || ['resolved', 'not_found', 'ambiguous'].indexOf(row.status) === -1) return;
+  if (row.status === 'resolved' && !validAddressLocation(row)) return;
+  addressLocations[row.address_key] = row;
+}
+function readLocalAddressLocations() {
+  if (addressLocationsLoaded) return;
+  addressLocationsLoaded = true;
+  try { (JSON.parse(localStorage.getItem('address_locations_v1') || '[]')).forEach(rememberAddressLocation); } catch(e) {}
+}
+function saveLocalAddressLocations() {
+  try { localStorage.setItem('address_locations_v1', JSON.stringify(Object.keys(addressLocations).map(function(k){ return addressLocations[k]; }))); } catch(e) {}
+}
+function cachedAddressLocation(address) {
+  readLocalAddressLocations();
+  var row = addressLocations[clientAddressKey(address)];
+  if (!row) return null;
+  if (row.status !== 'resolved' && (!row.updated_at || Date.now() - Date.parse(row.updated_at) > 7 * 86400000)) return null;
+  return row;
+}
+async function loadAddressLocations() {
+  // The shared cache is private. Each Edge request can only resolve the one
+  // saved address supplied by the caller; the browser cannot list the table.
+  readLocalAddressLocations();
+}
+
+function lookupAddressLocation(address, priority) {
+  var clean = String(address || '').trim(), key = clientAddressKey(clean);
+  if (!key) return Promise.resolve(null);
+  var cached = cachedAddressLocation(clean);
+  if (cached) return Promise.resolve(cached);
+  if (addressLookupPending[key]) return addressLookupPending[key];
+  var promise = new Promise(function(resolve, reject){
+    var job = {address:clean, key:key, resolve:resolve, reject:reject};
+    if (priority) addressLookupQueue.unshift(job); else addressLookupQueue.push(job);
+  });
+  addressLookupPending[key] = promise;
+  drainAddressLookupQueue();
+  return promise;
+}
+async function fetchAddressLocation(address) {
+  for (var attempt = 0; attempt < 5; attempt++) {
+    var controller = new AbortController();
+    var timer = setTimeout(function(){ controller.abort(); }, 20000);
+    var response, row;
+    try {
+      response = await fetch(SUPA_URL + '/functions/v1/delivery-geocode', {
+        method:'POST', signal:controller.signal,
+        headers:{'apikey':SUPA_KEY, 'Authorization':'Bearer ' + SUPA_KEY, 'Content-Type':'application/json'},
+        body:JSON.stringify({address:address})
+      });
+      row = await response.json();
+    } finally { clearTimeout(timer); }
+    if (response.status === 429 && attempt < 4) {
+      await new Promise(function(resolve){ setTimeout(resolve, Math.min(15000, Math.max(1200, Number(row.retry_after_ms) || 1500))); });
+      continue;
+    }
+    if (!response.ok) {
+      var error = new Error(row && row.error === 'address_not_saved' ? 'Najpierw zapisz pełny adres klienta lub dostawy i spróbuj ponownie.' : 'Nie udało się pobrać lokalizacji. Sprawdź połączenie i ponów.');
+      error.status = response.status;
+      throw error;
+    }
+    if (!row || row.address_key !== clientAddressKey(address) || ['resolved','not_found','ambiguous'].indexOf(row.status) === -1
+        || (row.status === 'resolved' && !validAddressLocation(row))) throw new Error('Usługa nie zwróciła poprawnej lokalizacji adresu.');
+    row.updated_at = row.updated_at || new Date().toISOString();
+    return row;
+  }
+  throw new Error('Usługa lokalizacji jest zajęta. Spróbuj ponownie za chwilę.');
+}
+async function drainAddressLookupQueue() {
+  if (addressLookupRunning) return;
+  addressLookupRunning = true;
+  try {
+    while (addressLookupQueue.length) {
+      var job = addressLookupQueue.shift();
+      try {
+        var row = cachedAddressLocation(job.address) || await fetchAddressLocation(job.address);
+        rememberAddressLocation(row); saveLocalAddressLocations(); job.resolve(row);
+      } catch(e) { job.reject(e); }
+      finally { delete addressLookupPending[job.key]; }
+    }
+  } finally { addressLookupRunning = false; }
+}
+
+function nearbyClientKey(client) {
+  return client.clientId ? 'id:' + client.clientId : 'pair:' + clientMatchText(client.name || client.clientName) + '\u0000' + clientAddressKey(client.addr);
+}
+function sameNearbyClient(client, stop) {
+  if (client.clientId && stop.clientId) return client.clientId === stop.clientId;
+  return !!(client.name && stop.clientName) && clientMatchText(client.name) === clientMatchText(stop.clientName)
+    && clientAddressKey(client.addr) === clientAddressKey(stop.addr);
+}
+function nearbyStateCurrent(state) {
+  return state && state.panel.isConnected && state.panel._nearbyState === state
+    && document.getElementById('delivery-date').value === state.date && stops[state.idx] === state.stop
+    && clientAddressKey(state.stop.addrOverride || state.stop.addr) === state.addressKey;
+}
+function nearbyCandidates(stop) {
+  var seen = Object.create(null);
+  return getClientsDB().filter(function(c){
+    var key = nearbyClientKey(c);
+    if (!String(c.addr || '').trim() || sameNearbyClient(c, stop) || seen[key]) return false;
+    seen[key] = true; return true;
+  });
+}
+function toggleNearby(idx) {
+  var panel = document.getElementById('nearby-' + idx);
+  if (!panel) return;
+  if (panel.style.display === 'none') {
+    panel.style.display = ''; showNearby(idx, 5);
+  } else { panel.style.display = 'none'; }
+}
+function invalidateNearbyForStop(idx) {
+  var panel = document.getElementById('nearby-' + idx);
+  if (!panel) return;
+  var radius = panel._nearbyState ? panel._nearbyState.radius : 5;
+  panel._nearbyState = null;
+  if (panel.style.display !== 'none') showNearby(idx, radius);
+}
+async function showNearby(idx, radiusKm) {
+  var panel = document.getElementById('nearby-' + idx), stop = stops[idx];
+  if (!panel || !stop) return;
+  var address = String(stop.addrOverride || stop.addr || '').trim();
+  var state = panel._nearbyState;
+  if (nearbyStateCurrent(state)) {
+    state.radius = radiusKm; renderNearbyResults(state);
+    if (!state.filling && state.origin && !state.error) fillNearbyLocations(state);
     return;
   }
-  listEl.innerHTML = results.map(function(c){
-    return '<div class="nearby-item">'
-      +'<span class="nearby-dist">'+c.dist.toFixed(1)+' km</span>'
-      +'<span class="nearby-name">'+esc(c.name)+'</span>'
-      +(c.phone?'<a href="tel:'+esc(c.phone)+'" class="nearby-phone">📞 '+esc(c.phone)+'</a>':'')
-      +'</div>';
-  }).join('');
+  state = {panel:panel, idx:idx, stop:stop, date:document.getElementById('delivery-date').value,
+    address:address, addressKey:clientAddressKey(address), radius:radiusKm, origin:null,
+    candidates:nearbyCandidates(stop), visits:buildClientVisitIndex(), loading:true, filling:false, error:'', results:[]};
+  panel._nearbyState = state;
+  renderNearbyResults(state);
+  if (!address) { state.loading = false; state.error = 'Uzupełnij adres dostawy, aby znaleźć klientów w pobliżu.'; renderNearbyResults(state); return; }
+  try {
+    await daySaveQueue;
+    await Promise.all([loadAddressLocations(false), refreshVisitHistory(false)]);
+    if (!nearbyStateCurrent(state)) return;
+    state.visits = buildClientVisitIndex();
+    state.candidates = nearbyCandidates(state.stop);
+    state.origin = await lookupAddressLocation(address, true);
+    if (!nearbyStateCurrent(state)) return;
+    if (!validAddressLocation(state.origin)) {
+      state.error = state.origin && state.origin.status === 'ambiguous'
+        ? 'Adres dostawy jest niejednoznaczny. Uzupełnij miejscowość, ulicę i numer.'
+        : 'Nie rozpoznano adresu dostawy. Sprawdź miejscowość, ulicę i numer.';
+      state.origin = null;
+    }
+  } catch(e) { state.error = e.message || 'Nie udało się pobrać danych. Sprawdź połączenie i ponów.'; }
+  finally { state.loading = false; if (nearbyStateCurrent(state)) renderNearbyResults(state); }
+  if (nearbyStateCurrent(state) && state.origin) fillNearbyLocations(state);
+}
+async function fillNearbyLocations(state) {
+  if (state.filling || !nearbyStateCurrent(state) || !state.origin) return;
+  state.filling = true; state.error = '';
+  var originCity = clientMatchText(state.stop.addrCity || state.address.split(',').pop().replace(/\d{2}-\d{3}/g, '').trim());
+  var todo = state.candidates.slice().sort(function(a,b){
+    return Number(clientMatchText(b.city) === originCity) - Number(clientMatchText(a.city) === originCity);
+  });
+  renderNearbyResults(state);
+  try {
+    for (var i = 0; i < todo.length; i++) {
+      if (!nearbyStateCurrent(state) || state.panel.style.display === 'none') break;
+      if (!cachedAddressLocation(todo[i].addr)) await lookupAddressLocation(todo[i].addr, false);
+      if (nearbyStateCurrent(state)) renderNearbyResults(state);
+    }
+  } catch(e) { state.error = e.message || 'Uzupełnianie lokalizacji zostało przerwane. Ponów po odzyskaniu połączenia.'; }
+  finally { state.filling = false; if (nearbyStateCurrent(state)) renderNearbyResults(state); }
+}
+function retryNearby(idx) {
+  var panel = document.getElementById('nearby-' + idx);
+  if (!panel) return;
+  var radius = panel._nearbyState ? panel._nearbyState.radius : 5;
+  panel._nearbyState = null; showNearby(idx, radius);
+}
+function renderNearbyResults(state) {
+  if (!nearbyStateCurrent(state)) return;
+  state.panel.querySelectorAll('.nearby-radius button').forEach(function(b){ b.classList.toggle('active', Number(b.dataset.r) === state.radius); });
+  var list = state.panel.querySelector('.nearby-list');
+  if (state.loading) { list.innerHTML = '<p class="nearby-status" role="status">Ustalanie lokalizacji dostawy i pobieranie historii…</p>'; return; }
+  var checkedLocations = 0, located = 0;
+  var rows = state.candidates.map(function(c){
+    var location = cachedAddressLocation(c.addr);
+    if (location) checkedLocations++;
+    if (!validAddressLocation(location)) return null;
+    located++;
+    return {client:c, distance:state.origin ? haversine(state.origin, location) : Infinity};
+  }).filter(function(r){ return r && r.distance <= state.radius; }).sort(function(a,b){return a.distance-b.distance;});
+  state.results = rows;
+  var message = '<p class="nearby-status">Od adresu tej dostawy: <strong>' + esc(state.address) + '</strong><br>Odległość w linii prostej.</p>';
+  if (state.origin) {
+    if (visitHistoryError) message += '<p class="nearby-status">' + esc(visitHistoryNotice()) + '</p>';
+    message += '<p class="nearby-status" role="status">Lokalizacja dostępna dla <strong>' + located + ' z ' + state.candidates.length + '</strong> klientów. Sprawdzono ' + checkedLocations + ' adresów.'
+      + (state.filling && checkedLocations < state.candidates.length ? ' Rozpoznawanie pozostałych adresów…' : '') + '</p>';
+    if (!rows.length) message += '<p class="nearby-status">Brak klientów z rozpoznaną lokalizacją w promieniu ' + state.radius + ' km.'
+      + (located < state.candidates.length ? ' Wynik nie obejmuje jeszcze wszystkich adresów.' : '') + '</p>';
+    message += rows.slice(0,20).map(function(r,i){
+      var c = r.client;
+      var planned = stops.some(function(s){return sameNearbyClient(c,s);});
+      var tel = String(c.phone || '').replace(/[^+\d]/g, '');
+      return '<div class="nearby-result"><div class="nearby-result-head"><strong>' + esc(c.name || c.addr) + '</strong><span class="nearby-dist">' + r.distance.toFixed(1) + ' km</span></div>'
+        + '<div class="nearby-result-address">' + esc(c.addr) + '</div>'
+        + renderClientVisitSummary(c, state.visits, {compact:true})
+        + '<div class="nearby-result-actions">'
+        + (tel ? '<a class="btn btn-outline btn-xs" href="tel:' + esc(tel) + '">📞 Zadzwoń</a>' : '')
+        + (planned ? '<span class="nearby-planned">Już w planie tego dnia</span>' : '<button type="button" class="btn btn-outline btn-xs" onclick="addNearbyClient(' + state.idx + ',' + i + ')">＋ Dodaj do planu</button>')
+        + '</div></div>';
+    }).join('');
+    if (rows.length > 20) message += '<p class="nearby-status">Pokazano 20 najbliższych z ' + rows.length + ' klientów w wybranym promieniu.</p>';
+  }
+  if (state.error) message += '<p class="nearby-error" role="alert">' + esc(state.error) + '</p><button type="button" class="btn btn-outline btn-xs" onclick="retryNearby(' + state.idx + ')">Ponów</button>';
+  if (state.origin) message += '<p class="nearby-source">Źródło lokalizacji: <a href="https://services.gugik.gov.pl/uug/opis.html" target="_blank" rel="noopener noreferrer">GUGiK / PRG</a>.</p>';
+  list.innerHTML = message;
+}
+async function addNearbyClient(idx, resultIndex) {
+  var panel = document.getElementById('nearby-' + idx), state = panel && panel._nearbyState;
+  if (!nearbyStateCurrent(state) || !state.results[resultIndex]) return;
+  var candidate = state.results[resultIndex].client;
+  var matches = getClientsDB().filter(function(c){ return nearbyClientKey(c) === nearbyClientKey(candidate); });
+  if (matches.length !== 1 || clientsSignature(matches[0]) !== clientsSignature(candidate)) { retryNearby(idx); toast('Karta klienta zmieniła się. Wybierz go ponownie.'); return; }
+  var c = matches[0];
+  if (stops.some(function(s){return sameNearbyClient(c,s);})) { toast('Ten klient jest już w planie tego dnia.'); return; }
+  var location = cachedAddressLocation(c.addr), newIdx = stops.length;
+  var displayOrder = order.length === stops.length ? order.slice() : stops.map(function(_,i){return i;});
+  var stop = {addr:c.addr, clientName:c.name || '', phone:c.phone || '', goods:'', note:'', priority:'normal', cash:false, cashAmount:0,
+    addrOverride:'', addrStreet:'', addrZip:'', addrCity:'', lat:validAddressLocation(location)?location.lat:null, lng:validAddressLocation(location)?location.lng:null};
+  if (c.clientId) stop.clientId = c.clientId;
+  if (validAddressLocation(location)) stop.geoAddressKey = clientAddressKey(c.addr);
+  stops.push(stop); order = displayOrder.concat([newIdx]);
+  var saved = await saveDay(); renderDispatcher();
+  toast(saved ? 'Klient dodany do planu ✓' : currentPlanRefreshRequired ? 'Zachowano szkic. Wczytaj aktualny plan i ponów dodanie.' : 'Dodano lokalnie. Zapis w chmurze wymaga odzyskania połączenia.');
 }
 
 
@@ -1583,13 +2162,13 @@ async function copySelectedStops() {
       addr:s.addr, clientName:s.clientName||'', goods:s.goods||'', note:s.note||'',
       phone:s.phone||'', cash:s.cash||false, cashAmount:s.cashAmount||0,
       priority:s.priority||'normal', addrOverride:'', addrStreet:'', addrZip:'', addrCity:'',
-      lat:s.lat||null, lng:s.lng||null
+      lat:s.addrOverride?null:(s.lat||null), lng:s.addrOverride?null:(s.lng||null),
+      clientId:s.clientId||undefined, geoAddressKey:s.addrOverride?'':(s.geoAddressKey||'')
     });
     copied++;
   });
   if(!copied){toast('Nie zaznaczono żadnych przystanków.');return;}
   order=stops.map(function(_,i){return i;});
-  checked={};
   await saveDay();
   renderDispatcher();
   closeClientModal();
@@ -1617,16 +2196,18 @@ async function saveTypedAddr(idx, val) {
   stops[idx].lat = null;
   stops[idx].lng = null;
   await saveDay();
+  refreshClientVisitDisplays();
+  invalidateNearbyForStop(idx);
 }
 
 
 /* ═══════════════ STATYSTYKI ═══════════════ */
 var statsPeriodDays = 30;
 
-function setStatsPeriod(days) {
+function setStatsPeriod(days, button) {
   statsPeriodDays = days;
   document.querySelectorAll('#stats-period button').forEach(function(b){ b.classList.remove('active'); });
-  event.target.classList.add('active');
+  if (button) button.classList.add('active');
   renderStats();
 }
 
@@ -1638,8 +2219,13 @@ function getAllDeliveryData() {
     var ds = k.replace('delivery_','');
     try {
       var d = JSON.parse(localStorage.getItem(k));
-      var st = (d.stops||[]).filter(function(s){ return s.addr && s.addr.trim(); });
-      if (st.length) data.push({ date: ds, stops: st, checked: d.checked||{} });
+      var st = [], status = {};
+      (d.stops||[]).forEach(function(stop, originalIndex){
+        if (!stop || !String(stop.addr||'').trim()) return;
+        if (clientVisitIsConfirmed((d.checked||{})[originalIndex])) status[st.length] = d.checked[originalIndex];
+        st.push(stop);
+      });
+      if (st.length && clientVisitDateNumber(ds)!==null) data.push({date:ds,stops:st,checked:status});
     } catch(e){}
   }
   data.sort(function(a,b){ return a.date.localeCompare(b.date); });
@@ -1647,11 +2233,8 @@ function getAllDeliveryData() {
 }
 
 function filterByPeriod(data) {
-  if (!statsPeriodDays) return data;
-  var cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - statsPeriodDays);
-  var cutStr = cutoff.toLocaleDateString('sv');
-  return data.filter(function(d){ return d.date >= cutStr; });
+  var today = todayStr(), cutoff = statsPeriodDays ? clientVisitDateFromNumber(clientVisitDateNumber(today) - statsPeriodDays + 1) : '0001-01-01';
+  return data.filter(function(d){ return d.date >= cutoff && d.date <= today; });
 }
 
 function renderStats() {
@@ -1665,10 +2248,8 @@ function renderStats() {
   var completedStops = [];
   var todayS = todayStr();
   data.forEach(function(d){
-    var anyChk = d.checked && Object.keys(d.checked).some(function(k){ return k!=='_notes' && d.checked[k]; });
-    var past = d.date < todayS;
     d.stops.forEach(function(s, si){
-      var done = (d.checked && d.checked[si]) || (past && !anyChk);
+      var done = clientVisitIsConfirmed(d.checked && d.checked[si]);
       if (!done) return;
       totalStops++;
       if (s.priority==='high') highPrio++;
@@ -1686,18 +2267,16 @@ function renderStats() {
   var avgKm=kmDays?Math.round(totalKm/kmDays):0;
 
   document.getElementById('stats-kpi').innerHTML =
-    '<div class="stat-card"><div class="stat-card-val">'+totalDays+'</div><div class="stat-card-label">Dni z dostawami</div></div>'
-    +'<div class="stat-card"><div class="stat-card-val">'+totalStops+'</div><div class="stat-card-label">Łącznie przystanków</div></div>'
-    +'<div class="stat-card"><div class="stat-card-val">'+avgPerDay+'</div><div class="stat-card-label">Średnio dost. / dzień</div></div>'
-    +'<div class="stat-card"><div class="stat-card-val">'+totalKm+'</div><div class="stat-card-label">Łącznie km</div><div class="stat-card-sub">śr. '+avgKm+' km / dzień</div></div>';
+    '<div class="stat-card"><div class="stat-card-val">'+totalDays+'</div><div class="stat-card-label">Dni z planem</div></div>'
+    +'<div class="stat-card"><div class="stat-card-val">'+totalStops+'</div><div class="stat-card-label">Potwierdzone dostawy</div></div>'
+    +'<div class="stat-card"><div class="stat-card-val">'+avgPerDay+'</div><div class="stat-card-label">Potwierdzone / dzień z planem</div></div>'
+    +'<div class="stat-card"><div class="stat-card-val">'+data.reduce(function(n,d){return n+d.stops.length;},0)+'</div><div class="stat-card-label">Wpisy w planach</div></div>';
 
   /* ── WYKRES DZIENNY ── */
   var last = data.slice(-28);
   var countDone = function(d){
-    var anyC = d.checked && Object.keys(d.checked).some(function(k){ return k!=='_notes' && d.checked[k]; });
-    var pastD = d.date < todayS;
     var n=0; d.stops.forEach(function(s,si){
-      if((d.checked&&d.checked[si])||(pastD&&!anyC)) n++;
+      if(clientVisitIsConfirmed(d.checked&&d.checked[si])) n++;
     }); return n;
   };
   var maxStops = Math.max.apply(null, last.map(function(d){return countDone(d);}).concat([1]));
@@ -1713,42 +2292,24 @@ function renderStats() {
     return '<span>'+(i%4===0?d.date.slice(8):'')+'</span>';
   }).join('');
 
-  /* ── TOP KLIENCI ── */
-  var clientCount = {};
+  /* Jedna wizyta klienta to jeden potwierdzony dzień, także przy kilku wpisach. */
+  var visitIndex = buildClientVisitIndex(), clientVisits = new Map();
   data.forEach(function(d){
-    var anyChk2 = d.checked && Object.keys(d.checked).some(function(k){ return k!=='_notes' && d.checked[k]; });
-    var past2 = d.date < todayS;
-    d.stops.forEach(function(s, si){
-      var done = (d.checked && d.checked[si]) || (past2 && !anyChk2);
-      if (!done) return;
-      var name = s.clientName || s.addr;
-      if (!name) return;
-      if (!clientCount[name]) clientCount[name] = {count:0, addr:s.addr};
-      clientCount[name].count++;
+    d.stops.forEach(function(stop, si){
+      if (!clientVisitIsConfirmed(d.checked[si])) return;
+      var summary = getClientVisitStats(stop,visitIndex);
+      if (!summary.key || summary.ambiguous) return;
+      if (!clientVisits.has(summary.key)) clientVisits.set(summary.key,{stop:stop,dates:new Set(),summary:summary});
+      clientVisits.get(summary.key).dates.add(d.date);
     });
   });
-  /* Oblicz zakres miesięcy */
-  var firstDate = data.length ? data[0].date : todayStr();
-  var lastDate = data.length ? data[data.length-1].date : todayStr();
-  var d1 = new Date(firstDate+'T12:00:00'), d2 = new Date(lastDate+'T12:00:00');
-  var monthSpan = Math.max(1, (d2.getFullYear()-d1.getFullYear())*12 + d2.getMonth()-d1.getMonth() + 1);
-
-  var topClients = Object.keys(clientCount).map(function(k){
-    return {name:k, count:clientCount[k].count, cash:clientCount[k].cash, cashAmt:clientCount[k].cashAmt, addr:clientCount[k].addr};
-  }).sort(function(a,b){return b.count-a.count;}).slice(0,15);
-  var maxCount = topClients.length ? topClients[0].count : 1;
-
+  var topClients = Array.from(clientVisits.values()).sort(function(a,b){return b.dates.size-a.dates.size;}).slice(0,15);
   document.querySelector('#stats-clients-table tbody').innerHTML =
-    '<tr><th class="rank">#</th><th>Klient</th><th style="text-align:right">Dostawy</th><th style="text-align:right">Śr. / mies.</th></tr>'
-    + topClients.map(function(c,i){
-      var barW = Math.round(c.count/maxCount*60);
-      return '<tr>'
-        +'<td class="rank">'+(i+1)+'</td>'
-        +'<td><strong>'+esc(c.name)+'</strong><div class="stat-bar" style="width:'+barW+'px"></div></td>'
-        +'<td style="text-align:right;font-family:var(--mono)">'+c.count+'×</td>'
-        +'<td style="text-align:right;font-family:var(--mono);color:var(--accent);font-weight:500">'+(c.count/monthSpan).toFixed(1)+'× / mies.</td>'
-        +'</tr>';
-    }).join('');
+    '<tr><th class="rank">#</th><th>Klient / częstotliwość</th><th style="text-align:right">Wizyty w okresie</th></tr>'
+    + (topClients.length ? topClients.map(function(c,i){
+      return '<tr><td class="rank">'+(i+1)+'</td><td><strong>'+esc(c.stop.clientName||c.stop.addr)+'</strong>'
+        +renderClientVisitSummary(c.stop,visitIndex,{compact:true})+'</td><td style="text-align:right;font-family:var(--mono)">'+c.dates.size+'×</td></tr>';
+    }).join('') : '<tr><td colspan="3">Brak jednoznacznie przypisanych, potwierdzonych wizyt w tym okresie.</td></tr>');
 
   /* ── TOP MIASTA ── */
   /* ── ZASIĘG OD BAZY ── */
@@ -1758,7 +2319,10 @@ function renderStats() {
     {label: '30–50 km', max: 50, count: 0},
     {label: 'powyżej 50 km', max: 9999, count: 0}
   ];
-  var geoStops = completedStops.filter(function(cs){ return cs.lat && cs.lng; });
+  var geoStops = completedStops.map(function(cs){
+    var location = cachedAddressLocation(cs.stop.addrOverride || cs.stop.addr);
+    return validAddressLocation(location) ? Object.assign({},cs,{lat:location.lat,lng:location.lng}) : cs;
+  }).filter(function(cs){ return cs.lat && cs.lng; });
   geoStops.forEach(function(cs) {
     var dist = haversine(DEPOT, {lat: cs.lat, lng: cs.lng});
     for (var r = 0; r < ranges.length; r++) {
@@ -1769,8 +2333,8 @@ function renderStats() {
   var avgDist = geoStops.length ? (geoStops.reduce(function(s,cs){ return s + haversine(DEPOT,{lat:cs.lat,lng:cs.lng}); },0) / geoStops.length).toFixed(1) : '—';
 
   document.getElementById('stats-range-kpi').innerHTML =
-    '<div class="stat-card"><div class="stat-card-val">'+avgDist+'</div><div class="stat-card-label">Średnia odległość (km)</div><div class="stat-card-sub">od Lesznowska 19, Błonie</div></div>'
-    +'<div class="stat-card"><div class="stat-card-val">'+geoStops.length+'</div><div class="stat-card-label">Dostawy z GPS</div><div class="stat-card-sub">z '+totalStops+' wykonanych</div></div>';
+    '<div class="stat-card"><div class="stat-card-val">'+avgDist+'</div><div class="stat-card-label">Średnia odległość w linii prostej (km)</div><div class="stat-card-sub">od Lesznowska 19, Błonie</div></div>'
+    +'<div class="stat-card"><div class="stat-card-val">'+geoStops.length+'</div><div class="stat-card-label">Dostawy z lokalizacją</div><div class="stat-card-sub">z '+totalStops+' wykonanych</div></div>';
 
   document.querySelector('#stats-range-table tbody').innerHTML =
     '<tr><th>Odległość</th><th style="text-align:right">Dostawy</th><th style="text-align:right">Udział</th><th style="width:40%"></th></tr>'
@@ -1818,6 +2382,7 @@ function moveToDay(idx) {
     var raw = localStorage.getItem(storageKey(targetDate));
     var target = raw ? JSON.parse(raw) : {stops:[], order:[], checked:{}};
     var copy = JSON.parse(JSON.stringify(s));
+    if (copy.addrOverride) { copy.lat=null; copy.lng=null; delete copy.geoAddressKey; }
     copy.addrOverride = ''; copy.addrStreet = ''; copy.addrZip = ''; copy.addrCity = '';
     target.stops.push(copy);
     target.order = target.stops.map(function(_,i){return i;});
@@ -1827,9 +2392,9 @@ function moveToDay(idx) {
       return supaFetch('delivery_plans', 'POST', {date:targetDate, stops:target.stops, order:target.order, checked:target.checked||{}});
     }).catch(function(){});
     /* Usuń z bieżącego dnia */
+    checked = checkedAfterRemoving(idx);
     stops.splice(idx, 1);
     order = stops.map(function(_,i){return i;});
-    checked = {};
     saveDay().then(function(){
       renderDispatcher();
       /* Odśwież widok kierowcy jeśli aktywny */
@@ -1846,7 +2411,8 @@ function moveAllToDay() {
     var target = raw ? JSON.parse(raw) : {stops:[], order:[], checked:{}};
     stops.forEach(function(s) {
       var copy = JSON.parse(JSON.stringify(s));
-      copy.addrOverride = ''; copy.addrStreet = ''; copy.addrZip = ''; copy.addrCity = '';
+      if (copy.addrOverride) { copy.lat=null; copy.lng=null; delete copy.geoAddressKey; }
+    copy.addrOverride = ''; copy.addrStreet = ''; copy.addrZip = ''; copy.addrCity = '';
       target.stops.push(copy);
     });
     target.order = target.stops.map(function(_,i){return i;});
@@ -1966,13 +2532,14 @@ function loadDriverNotes() {
 <div class="view" id="view-stats">
 <div class="container">
   <h2 style="font-size:18px;font-weight:600;margin-bottom:.5rem">📊 Statystyki dostaw</h2>
-  <p style="font-size:13px;color:var(--muted);margin-bottom:1.25rem">Analiza na podstawie historii zapisanej w systemie.</p>
+  <p style="font-size:13px;color:var(--muted);margin-bottom:.5rem">Realizacja według potwierdzeń dostaw, do dzisiaj włącznie.</p>
+  <div class="visit-history-status"></div>
 
   <div class="stat-period" id="stats-period">
-    <button class="active" onclick="setStatsPeriod(30)">30 dni</button>
-    <button onclick="setStatsPeriod(90)">90 dni</button>
-    <button onclick="setStatsPeriod(365)">Rok</button>
-    <button onclick="setStatsPeriod(0)">Wszystko</button>
+    <button class="active" onclick="setStatsPeriod(30,this)">30 dni</button>
+    <button onclick="setStatsPeriod(90,this)">90 dni</button>
+    <button onclick="setStatsPeriod(365,this)">Rok</button>
+    <button onclick="setStatsPeriod(0,this)">Wszystko</button>
   </div>
 
   <div class="stats-grid" id="stats-kpi"></div>
@@ -1986,7 +2553,8 @@ function loadDriverNotes() {
   </div>
 
   <div class="stat-section">
-    <h3>Najczęściej odwiedzani klienci</h3>
+    <h3>Częstotliwość wizyt u klientów</h3>
+    <p class="stats-clients-note">Ranking według wizyt w wybranym okresie. Jedna wizyta to jeden dzień z potwierdzoną dostawą. Przy kliencie: ostatnia wizyta oraz częstotliwość w 30 i 90 dniach do dziś.</p>
     <table class="stat-table" id="stats-clients-table"><tbody></tbody></table>
   </div>
 
