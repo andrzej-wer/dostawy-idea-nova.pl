@@ -242,9 +242,30 @@ nav{background:var(--nav-bg);padding:0 1rem;display:flex;align-items:center;gap:
 
 
 /* Historia wizyt i niezależne wyszukiwanie okolicy. */
-.client-visit-summary{background:var(--accent-soft);border:1px solid var(--border);border-radius:8px;padding:9px 11px;overflow-wrap:anywhere}
-.client-visit-summary strong,.client-visit-compact strong{color:var(--text2);font-family:var(--mono)}
-.client-visit-compact{overflow-wrap:anywhere}
+.client-visit-summary,.client-visit-compact{margin-top:6px;color:var(--text);line-height:1.4;overflow-wrap:anywhere}
+.client-visit-summary{background:var(--accent-soft);border:1px solid var(--border);border-radius:10px;padding:12px}
+.client-visit-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.client-visit-title{font-size:12px;font-weight:600;color:var(--text2)}
+.client-visit-frequency{display:inline-flex;align-items:center;border-radius:999px;padding:4px 9px;font-size:12px;line-height:1.25;font-weight:600;white-space:nowrap}
+.client-visit-frequency.is-often{background:#dcfce7;color:#166534}
+.client-visit-frequency.is-rare{background:#fff7ed;color:#9a3412}
+.client-visit-frequency.is-none{background:#e2e8f0;color:#475569}
+.client-visit-hint{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.client-visit-metrics{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,1.7fr);gap:14px}
+.client-visit-metric{min-width:0;display:flex;flex-direction:column;gap:4px}
+.client-visit-label{color:var(--muted);font-size:12px;line-height:1.3}
+.client-visit-value{font-family:var(--sans);font-size:26px;letter-spacing:-.03em;font-weight:700;color:var(--text);line-height:1.15;font-variant-numeric:tabular-nums}
+.client-visit-last .client-visit-value{font-size:17px;letter-spacing:-.01em;line-height:1.4}
+.client-visit-compact{padding-top:5px}
+.client-visit-compact .client-visit-heading{margin-bottom:7px;gap:6px}
+.client-visit-compact .client-visit-title{font-size:11px}
+.client-visit-compact .client-visit-frequency{font-size:11px;padding:3px 7px}
+.client-visit-compact .client-visit-metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.client-visit-compact .client-visit-label{font-size:11px}
+.client-visit-compact .client-visit-value{font-size:18px;letter-spacing:0}
+.client-visit-compact .client-visit-last{grid-column:1/-1;flex-direction:row;align-items:baseline;justify-content:space-between;gap:8px}
+.client-visit-compact .client-visit-last .client-visit-value{font-size:13px}
+@media(max-width:420px){.client-visit-summary .client-visit-metrics{grid-template-columns:1fr 1fr;gap:10px}.client-visit-summary .client-visit-last{grid-column:1/-1;flex-direction:row;align-items:baseline;justify-content:space-between;border-top:1px solid var(--border);padding-top:9px}.client-visit-summary .client-visit-last .client-visit-value{font-size:16px}}
 .visit-history-status{font-size:11px;line-height:1.5;color:var(--muted);margin:4px 0 10px}
 .client-row-details{flex:1;min-width:0}
 .client-row-details .client-row-name{display:block;overflow-wrap:anywhere}
@@ -1741,25 +1762,27 @@ function renderClientVisitSummary(clientOrStopOrClientIndex, index, options) {
   var stats = getClientVisitStats(clientOrStopOrClientIndex, index);
   var compact = !!options.compact;
   var cssClass = compact ? 'client-visit-compact' : 'client-visit-summary';
-  var style = 'font-size:' + (compact ? '11px' : '12px') + ';color:var(--muted);line-height:1.65;margin-top:5px';
-  if (stats.ambiguous || !stats.matched) return '<div class="' + cssClass + '" style="' + style + '">' + esc(stats.ambiguous ? 'Historia wymaga jednoznacznego przypisania do klienta.' : 'Brak jednoznacznego powiązania z historią wizyt.') + '</div>';
+  var available = !stats.ambiguous && stats.matched;
   function dateLabel(date) { return date ? date.slice(8, 10) + '.' + date.slice(5, 7) + '.' + date.slice(0, 4) : ''; }
-  function numberLabel(value) { return String(value).replace('.', ','); }
-  var lastText = !stats.lastVisitDate ? 'Brak potwierdzonych wizyt w dostępnej historii.'
-    : 'Ostatnia: ' + dateLabel(stats.lastVisitDate) + ' · ' + (stats.daysSinceLastVisit === 0 ? 'dzisiaj' : stats.daysSinceLastVisit === 1 ? 'wczoraj' : stats.daysSinceLastVisit + ' dni temu');
-  var html = '<div class="' + cssClass + '" style="' + style + '">'
-    + '<div>' + (compact ? 'Wizyty' : 'Potwierdzone wizyty') + ': <strong>' + esc(String(stats.visits30)) + '</strong> / 30 dni · <strong>' + esc(String(stats.visits90)) + '</strong> / 90 dni</div>'
-    + '<div>' + esc(lastText) + '</div>';
-  if (stats.averageIntervalDays !== null) {
-    html += '<div title="Średni odstęp między różnymi dniami z potwierdzoną wizytą w ostatnich 90 dniach">Średni odstęp ' + (compact ? '(90 dni)' : 'w 90 dniach') + ': ' + esc(numberLabel(stats.averageIntervalDays)) + ' dni</div>';
-  } else {
-    html += '<div>' + (compact ? 'Średni odstęp (90 dni): za mało wizyt.' : 'Za mało wizyt w ostatnich 90 dniach do wyliczenia odstępu.') + '</div>';
-  }
-  if (!compact && stats.unconfirmedDays90) html += '<div>Dni z planem bez potwierdzenia w ostatnich 90 dniach: ' + esc(stats.unconfirmedDays90) + '</div>';
-  if (!compact && stats.nextPlannedDate) html += '<div>Najbliższy plan: ' + esc(dateLabel(stats.nextPlannedDate)) + '</div>';
-  if (stats.ambiguousLegacyStops) html += '<div>Część starszych wpisów wymaga przypisania do klienta.</div>';
-  if (!compact) html += '<div style="font-size:11px">Jedna wizyta to jeden dzień z potwierdzoną dostawą.</div>';
-  return html + '</div>';
+  var frequency = !available
+    ? {label:'Brak danych', tone:'none', hint:'Nie można jednoznacznie przypisać historii do tego klienta.'}
+    : stats.ambiguousLegacyStops
+      ? {label:'Niepełne dane', tone:'none', hint:'Część starszych wpisów wymaga przypisania do klienta.'}
+      : stats.visits90 >= 6
+        ? {label:'Często', tone:'often', hint:'Co najmniej 6 dni z potwierdzoną wizytą w ostatnich 90 dniach.'}
+        : stats.visits90 > 0
+          ? {label:'Rzadko', tone:'rare', hint:'Od 1 do 5 dni z potwierdzoną wizytą w ostatnich 90 dniach.'}
+          : {label:'Brak wizyt w 90 dni', tone:'none', hint:'Brak potwierdzonych wizyt w ostatnich 90 dniach.'};
+  var lastVisit = !available ? '—' : stats.lastVisitDate
+    ? '<time datetime="' + esc(stats.lastVisitDate) + '">' + esc(dateLabel(stats.lastVisitDate)) + '</time>' : 'Brak';
+  return '<div class="' + cssClass + '" role="group" aria-label="Historia wizyt klienta">'
+    + '<div class="client-visit-heading"><span class="client-visit-title">Ostatnie wizyty</span>'
+    + '<span class="client-visit-frequency is-' + frequency.tone + '" title="' + esc(frequency.hint) + '">' + esc(frequency.label) + '<span class="client-visit-hint">. ' + esc(frequency.hint) + '</span></span></div>'
+    + '<div class="client-visit-metrics">'
+    + '<div class="client-visit-metric"><span class="client-visit-label">30 dni</span><strong class="client-visit-value">' + (available ? esc(String(stats.visits30)) : '—') + '</strong></div>'
+    + '<div class="client-visit-metric"><span class="client-visit-label">90 dni</span><strong class="client-visit-value">' + (available ? esc(String(stats.visits90)) : '—') + '</strong></div>'
+    + '<div class="client-visit-metric client-visit-last"><span class="client-visit-label">Ostatnia wizyta</span><strong class="client-visit-value">' + lastVisit + '</strong></div>'
+    + '</div></div>';
 }
 
 
