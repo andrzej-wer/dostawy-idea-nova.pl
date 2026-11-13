@@ -784,29 +784,35 @@ function nearestNeighbor(pts, startPoint){
   return{route:route, lastPoint:cur};
 }
 async function geocode(addr){
-  try {
-    await daySaveQueue;
-    var row = await lookupAddressLocation(addr, true);
-    return validAddressLocation(row) ? {lat:row.lat,lng:row.lng} : null;
-  } catch(e) { console.warn('Nie udało się ustalić lokalizacji adresu.'); return null; }
+  await daySaveQueue;
+  var row = await lookupAddressLocation(addr, true);
+  return validAddressLocation(row) ? {lat:row.lat,lng:row.lng} : null;
 }
 async function optimizeRoute(){
   var btn=document.getElementById('btn-optimize');
   if(!stops.length){toast('Dodaj najpierw przystanki.');return;}
   btn.textContent='⏳ Geokodowanie…'; btn.classList.add('optimizing'); btn.disabled=true;
   var toGeo = stops.filter(function(s,i){ return !s.lat && (s.addrOverride||s.addr||'').trim(); }).length;
-  var geoIdx = 0;
-  for(var i=0;i<stops.length;i++){
-    var geoAddr = (stops[i].addrOverride||stops[i].addr||'').trim();
-    if(!stops[i].lat && geoAddr){
-      geoIdx++;
-      btn.textContent='⏳ Geokodowanie '+geoIdx+'/'+toGeo+'…';
-      try {
-        var geo=await geocode(geoAddr); if(geo){stops[i].lat=geo.lat;stops[i].lng=geo.lng;stops[i].geoAddressKey=clientAddressKey(geoAddr);}
-      } catch(e){ console.warn('Geo failed for:',geoAddr,e); }
-      await new Promise(function(r){setTimeout(r,350);});
+  var geoIdx = 0, pendingGeo = [];
+  try {
+    for(var i=0;i<stops.length;i++){
+      var stop = stops[i], geoAddr = (stop.addrOverride||stop.addr||'').trim();
+      if(!stop.lat && geoAddr){
+        geoIdx++;
+        btn.textContent='⏳ Geokodowanie '+geoIdx+'/'+toGeo+'…';
+        var geo=await geocode(geoAddr);
+        if(geo) pendingGeo.push({stop:stop, address:geoAddr, geo:geo});
+        await new Promise(function(r){setTimeout(r,350);});
+      }
     }
+  } catch(e) {
+    btn.textContent='⚡ Optymalizuj trasę'; btn.classList.remove('optimizing'); btn.disabled=false;
+    var message = e && e.status === 400 && e.message ? e.message : 'Usługa lokalizacji jest niedostępna. Sprawdź połączenie i spróbuj ponownie.';
+    toast('⚠ Optymalizacja przerwana. '+message+' Plan pozostaje bez zmian.');
+    return;
   }
+  /* Zastosuj współrzędne dopiero po odczytach bez błędu usługi. */
+  pendingGeo.forEach(function(result){ result.stop.lat=result.geo.lat; result.stop.lng=result.geo.lng; result.stop.geoAddressKey=clientAddressKey(result.address); });
   btn.textContent='⏳ Optymalizacja…';
   /* Sortuj priorytetami; w każdej grupie: nearest-neighbor + 2-opt */
   var groups={'high':[],'normal':[]};
