@@ -5,9 +5,10 @@ This narrow backend resolves saved delivery/customer addresses independently of 
 ## Deployment contract
 
 - Review/apply `../../sql/delivery_geocode_cache.sql` through the project's migration workflow. This is a first-installation migration: confirm both target tables and functions are absent. It uses plain `CREATE`, never drops or replaces an existing object, and preserves the required RLS/permission restrictions.
-- Run the read-only `../../sql/verify_delivery_geocode_private.sql` after applying it; every `passed` value must be true. This inspects actual grants, column permissions, RLS and function privileges without reading address rows.
+- Run the read-only `../../sql/verify_delivery_geocode_private.sql` after applying it; all four `passed` values must be true. This inspects actual grants, column permissions, RLS and function privileges without reading address rows.
 - Deploy this function as `delivery-geocode` with **`verify_jwt=true`** and this directory's `deno.json`/lockfile.
 - Supabase provides the backend URL and service key. No service key belongs in `index.html` or the response.
+- Supabase also provides `SUPABASE_ANON_KEY` (or `SUPABASE_PUBLISHABLE_KEYS.default`). Saved-address validation uses that public key and the incoming caller's gateway-verified `Authorization`, preserving existing source-table permissions and RLS. It requires no new grants on `clients_db` or `delivery_plans`. The service key is used only for the private cache and limiter RPCs.
 - Optional `DELIVERY_GEOCODE_ORIGINS` is a comma-separated allowlist; defaults to `https://dostawy.idea-nova.pl,https://andrzej-wer.github.io`.
 - Optional `DELIVERY_UUG_URL` changes the upstream compatible UUG endpoint without changing the browser.
 - Display `Dane adresowe: GUGiK / PRG` beside nearby distances. Distances are straight-line distances, not road distances or live GPS tracking.
@@ -24,7 +25,7 @@ Use one frontend queue for the whole page. Render the browser's own previously o
 
 Both cache tables have RLS enabled and no privileges for `PUBLIC`, `anon` or `authenticated`. Only the server-side `service_role` can read/write the address cache. The browser must not query `delivery_address_locations` through REST, enumerate it, or load a list of cached addresses. There is no batch/list endpoint. A caller supplies one already-known saved address to the function and receives only that address's result; its own browser memory may retain those individual results.
 
-Only addresses already in `clients_db` or `delivery_plans` (including `addrOverride`) are accepted. The allowlist is cached for 30 seconds in a warm worker and refreshed on a miss. Names, phones and notes are never sent to GUGiK. The service does not accept an arbitrary upstream URL from the browser.
+Only addresses already visible to the caller in `clients_db` or `delivery_plans` (including `addrOverride`) are accepted. The allowlist is cached for 30 seconds in a warm worker and refreshed on a miss. A SHA-256 digest of the incoming authorization isolates callers; there is at most one cached snapshot and one pending source read, and different callers never reuse each other's results. JWTs are not logged or stored in the snapshot. Names, phones and notes are never sent to GUGiK. The service does not accept an arbitrary upstream URL from the browser.
 
 The database enforces one active upstream request plus at least 1100 ms between starts across all Edge workers. Cache lookups bypass this limiter. A 30-second lease expires if a worker dies. Provider failures apply a global backoff.
 

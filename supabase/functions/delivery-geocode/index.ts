@@ -20,11 +20,13 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
 // Supabase injects these server-side values. They are never returned to the browser.
 const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ||
   JSON.parse(Deno.env.get("SUPABASE_SECRET_KEYS") || "{}").default || "";
+const PUBLIC_KEY = Deno.env.get("SUPABASE_ANON_KEY") ||
+  JSON.parse(Deno.env.get("SUPABASE_PUBLISHABLE_KEYS") || "{}").default || "";
 const UUG_URL = Deno.env.get("DELIVERY_UUG_URL") || "https://services.gugik.gov.pl/uug/";
 const SOURCE = "gugik-uug";
 
-let allowedSnapshot: { expires: number; addresses: Map<string, Hint> } | null = null;
-let allowedLoading: Promise<Map<string, Hint>> | null = null;
+let allowedSnapshot: { owner: string; expires: number; addresses: Map<string, Hint> } | null = null;
+let allowedLoading: { owner: string; promise: Promise<Map<string, Hint>> } | null = null;
 
 class RequestFailure extends Error {
   constructor(public code: string, public httpStatus = 503, public retryMs = 0) { super(code); }
@@ -45,12 +47,11 @@ function response(origin: string, data: unknown, status = 200, retryMs = 0): Res
   return new Response(JSON.stringify(data), { status, headers });
 }
 
-async function database(path: string, method = "GET", body?: unknown, prefer?: string): Promise<unknown> {
+async function databaseRequest(path: string, headers: Record<string, string>, method = "GET", body?: unknown, prefer?: string): Promise<unknown> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 8000);
   try {
-    const headers: Record<string, string> = { apikey: SERVICE_KEY, "Content-Type": "application/json" };
-    if (!SERVICE_KEY.startsWith("sb_secret_")) headers.Authorization = "Bearer " + SERVICE_KEY;
+    headers["Content-Type"] = "application/json";
     if (prefer) headers.Prefer = prefer;
     const result = await fetch(SUPABASE_URL + "/rest/v1/" + path, {
       method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: controller.signal,
@@ -61,6 +62,18 @@ async function database(path: string, method = "GET", body?: unknown, prefer?: s
   } finally { clearTimeout(timer); }
 }
 
+function cacheDatabase(path: string, method = "GET", body?: unknown, prefer?: string): Promise<unknown> {
+  const headers: Record<string, string> = { apikey: SERVICE_KEY };
+  if (!SERVICE_KEY.startsWith("sb_secret_")) headers.Authorization = "Bearer " + SERVICE_KEY;
+  return databaseRequest(path, headers, method, body, prefer);
+}
+
+function sourceDatabase(path: string, authorization: string): Promise<unknown> {
+  // Saved addresses are read only with the gateway-verified caller's existing
+  // permissions/RLS. The service role is restricted to the new private cache.
+  return databaseRequest(path, { apikey: PUBLIC_KEY, Authorization: authorization });
+}
+
 function rows(value: unknown): JsonRow[] {
   if (!Array.isArray(value) || value.some((row) => !row || typeof row !== "object")) throw new RequestFailure("database_unavailable");
   return value as JsonRow[];
@@ -68,17 +81,31 @@ function rows(value: unknown): JsonRow[] {
 
 function text(value: unknown): string { return typeof value === "string" ? value : ""; }
 
-async function knownAddresses(): Promise<Map<string, Hint>> {
-  if (allowedSnapshot && allowedSnapshot.expires > Date.now()) return allowedSnapshot.addresses;
-  if (allowedLoading) return allowedLoading;
-  allowedLoading = (async () => {
+async function knownAddresses(authorization: string, forceRefresh = false): Promise<Map<string, Hint>> {
+  // Keep only one snapshot and one pending source read. A digest isolates
+  // callers without retaining or logging their JWT in the cached snapshot.
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(authorization));
+  const owner = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  for (;;) {
+    if (!forceRefresh && allowedSnapshot?.owner === owner && allowedSnapshot.expires > Date.now()) return allowedSnapshot.addresses;
+    const pending = allowedLoading;
+    if (pending) {
+      if (pending.owner === owner) return pending.promise;
+      // A different caller may wait for the bounded loading slot, but must
+      // never reuse that caller's data or inherit their authorization failure.
+      try { await pending.promise; } catch { /* Retry with this caller's own rights. */ }
+      continue;
+    }
+    break;
+  }
+  const promise = (async () => {
     const known = new Map<string, Hint>();
     function add(address: unknown, hint: Hint = {}) {
       if (typeof address !== "string" || !address.trim() || address.length > 300) return;
       const key = addressKey(address);
       if (!known.has(key)) known.set(key, hint);
     }
-    const clients = rows(await database("clients_db?select=data&order=id.asc&limit=2"));
+    const clients = rows(await sourceDatabase("clients_db?select=data&order=id.asc&limit=2", authorization));
     if (clients.length > 1) throw new RequestFailure("client_database_ambiguous");
     for (const row of clients) {
       for (const client of rows(row.data)) {
@@ -89,7 +116,7 @@ async function knownAddresses(): Promise<Map<string, Hint>> {
     // accept arbitrary browser strings as a publicly callable geocoding proxy.
     for (let offset = 0; ; offset += 500) {
       if (offset >= 10000) throw new RequestFailure("address_registry_too_large");
-      const plans = rows(await database("delivery_plans?select=stops&order=id.asc&limit=500&offset=" + offset));
+      const plans = rows(await sourceDatabase("delivery_plans?select=stops&order=id.asc&limit=500&offset=" + offset, authorization));
       for (const plan of plans) {
         for (const stop of rows(plan.stops)) {
           add(stop.addr);
@@ -98,15 +125,17 @@ async function knownAddresses(): Promise<Map<string, Hint>> {
       }
       if (plans.length < 500) break;
     }
-    allowedSnapshot = { addresses: known, expires: Date.now() + 30000 };
+    allowedSnapshot = { owner, addresses: known, expires: Date.now() + 30000 };
     return known;
   })();
-  try { return await allowedLoading; }
-  finally { allowedLoading = null; }
+  const loading = { owner, promise };
+  allowedLoading = loading;
+  try { return await promise; }
+  finally { if (allowedLoading === loading) allowedLoading = null; }
 }
 
 async function cached(key: string): Promise<CachedLocation | null> {
-  const result = rows(await database("delivery_address_locations?address_key=eq." + encodeURIComponent(key) + "&select=address_key,address,lat,lng,status,precision,source,updated_at&limit=1"));
+  const result = rows(await cacheDatabase("delivery_address_locations?address_key=eq." + encodeURIComponent(key) + "&select=address_key,address,lat,lng,status,precision,source,updated_at&limit=1"));
   if (!result.length) return null;
   const row = result[0] as CachedLocation;
   if (row.status === "resolved" && Number.isFinite(row.lat) && Number.isFinite(row.lng)) return row;
@@ -121,8 +150,9 @@ export async function handler(request: Request): Promise<Response> {
   if (request.method !== "POST") return response(origin, { error: "method_not_allowed" }, 405);
   // Deploy with verify_jwt=true. Origin checks complement, rather than replace,
   // the gateway's JWT verification and the saved-address allowlist below.
-  if (!request.headers.get("authorization")?.startsWith("Bearer ")) return response(origin, { error: "authorization_required" }, 401);
-  if (!SUPABASE_URL || !SERVICE_KEY) return response(origin, { error: "backend_not_configured" }, 503);
+  const authorization = request.headers.get("authorization") || "";
+  if (!authorization.startsWith("Bearer ")) return response(origin, { error: "authorization_required" }, 401);
+  if (!SUPABASE_URL || !SERVICE_KEY || !PUBLIC_KEY) return response(origin, { error: "backend_not_configured" }, 503);
 
   let leaseToken: string | null = null;
   let backoffMs = 0;
@@ -136,19 +166,18 @@ export async function handler(request: Request): Promise<Response> {
     const address = (payload as { address: unknown }).address;
     if (typeof address !== "string" || !address.trim() || address.length > 300 || /[\u0000-\u001f]/.test(address)) throw new RequestFailure("invalid_address", 400);
     const key = addressKey(address);
-    let known = await knownAddresses();
+    let known = await knownAddresses(authorization);
     if (!known.has(key)) {
       // A client/one-off delivery may have just been saved after this worker's
       // 30-second snapshot. Refresh once before rejecting it.
-      allowedSnapshot = null;
-      known = await knownAddresses();
+      known = await knownAddresses(authorization, true);
     }
     if (!known.has(key)) throw new RequestFailure("address_not_saved", 400);
     const previous = await cached(key);
     if (previous) return response(origin, { ...previous, cached: true });
 
     const token = crypto.randomUUID();
-    const lease = rows(await database("rpc/claim_delivery_geocode_slot", "POST", { p_token: token }));
+    const lease = rows(await cacheDatabase("rpc/claim_delivery_geocode_slot", "POST", { p_token: token }));
     if (lease.length !== 1 || lease[0].granted !== true) {
       const retryMs = Math.max(1100, Number(lease[0]?.retry_after_ms) || 1500);
       throw new RequestFailure("rate_limited", 429, retryMs);
@@ -202,7 +231,7 @@ export async function handler(request: Request): Promise<Response> {
     const record: CachedLocation = {
       address_key: key, address: address.trim(), ...location, source: SOURCE, updated_at: new Date().toISOString(),
     };
-    const saved = rows(await database("delivery_address_locations?on_conflict=address_key", "POST", record, "resolution=merge-duplicates,return=representation"));
+    const saved = rows(await cacheDatabase("delivery_address_locations?on_conflict=address_key", "POST", record, "resolution=merge-duplicates,return=representation"));
     if (saved.length !== 1) throw new RequestFailure("cache_save_failed");
     return response(origin, { ...record, cached: false });
   } catch (error) {
@@ -219,7 +248,7 @@ export async function handler(request: Request): Promise<Response> {
       // The slot is claimed before a cache recheck. Account for that database
       // latency so spacing is measured from the real upstream start.
       const releaseBackoff = Math.max(backoffMs, lastUpstreamStart ? 1100 - (Date.now() - lastUpstreamStart) : 0);
-      try { await database("rpc/finish_delivery_geocode_slot", "POST", { p_token: leaseToken, p_backoff_ms: releaseBackoff }); }
+      try { await cacheDatabase("rpc/finish_delivery_geocode_slot", "POST", { p_token: leaseToken, p_backoff_ms: releaseBackoff }); }
       catch { console.warn("delivery-geocode", "lease_release_failed"); }
     }
   }
